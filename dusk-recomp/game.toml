@@ -1,0 +1,62 @@
+# Digimon World: Dusk (USA rev 0, A6RE) — title-owned runner configuration.
+# ROM identity is verified by tools/prepare_dusk.py; the runner rejects a
+# different cartridge before applying any of these settings.
+#
+# Dusk is the North American release of the engine shared with Digimon Story:
+# Sunburst (A3VJ): identical ARM7 build (166,336 bytes), near-identical ARM9.
+
+[game]
+name = "Digimon World Dusk"
+id = "A6RE"
+region = "USA"
+revision = 0
+status = "phase-1 bring-up: main ARM9/ARM7 native banks; overlays and firmware on live-byte interpreter tier until coverage promotion"
+rom = "../Digimon World - Dusk (USA).nds"
+rom_size = 0x04000000
+sha1 = "de1a1915e07288ffad654f3f9f2eb730a0fd1d9c"
+sha256 = "df9522e07be99c5622e0211d3a50132776784db3fb28f42fc7392f588e1ae8cb"
+[display]
+# Both screens are used by the game (top: field/dialogue, bottom: touch UI).
+# Keep the stacked native 256x192 compositor for bring-up parity before any
+# audited adaptive layout is considered.
+screen_layout = "stacked"
+supersampling = 1
+antialiasing = 0
+
+[system]
+# Boot the inserted cartridge directly with generated firmware tables. The
+# retail-firmware path is not usable for this port: the runner SHA-1-gates a
+# firmware dump against a hash no commonly available image matches, so every
+# gate and the play launcher use the direct path explicitly.
+startup_mode = "automatic"
+boot = "direct"
+generated_firmware = true
+
+[cartridge]
+# EEPROM 64 KiB (512 Kbit) — the Dusk-family default. Public databases list
+# this title as "Unknown"; the same-engine Lost Evolution (A6RE sibling) and
+# A6RE both need manual EEPROM 64K in melonDS/DeSmuME. Verify against a
+# melonDS reference save during the vertical-slice phase; the debug server's
+# spi_w event stream is the runtime confirmation path.
+save_type = "eeprom"
+save_size = 65536
+
+[arm9]
+rom_offset = 0x00004000
+entry_pc = 0x02000800
+load_address = 0x02000000
+size = 0x00131098
+
+[arm7]
+rom_offset = 0x00280200
+entry_pc = 0x02380000
+load_address = 0x02380000
+size = 0x000289C0
+
+[framework]
+# The framework is vendored under <project>/framework and pinned by the
+# .git submodule-free copy; the runner does not read this table (it is
+# documentation for humans and for tools/dusk.py).
+path = "../../framework/ndsrecomp"
+ui_path = "../../framework/recomp-ui"
+ndsrecomp_version = "0.6.10"

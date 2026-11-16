@@ -1,29 +1,147 @@
 # How it works
 
-## Static recompilation in one page
+This is a **static recompilation** port: the game's NDS code is translated to C
+at build time and compiled to x64. Nothing simulates the ARM9/ARM7 instruction
+stream at runtime except one bounded fallback path described below.
 
-A Nintendo DS has two ARM CPUs. The **ARM9** (ARMv5TE) runs the game. The **ARM7** (ARMv4T) handles sound, touch, the real-time clock and Wi-Fi. An emulator decodes and runs their instructions one at a time while the game is running. This port does that work **ahead of time** instead:
+The same architecture is used by the [ndsrecomp](https://github.com/mstan/ndsrecomp)
+titles; this port adds the Dusk-specific configuration, banks and front end.
 
-1. **Prepare.** [`tools/prepare_dusk.py`](../tools/prepare_dusk.py) checks the ROM's size, SHA-1, game code, title and revision. It extracts the ARM9 program (1,249,432 bytes at `0x02000000`, entry `0x02000800`), the ARM7 program and the 18 ARM9 overlays, and writes the recompiler configs. Dusk's ARM9 ships uncompressed.
-2. **Find and translate.** The [ndsrecomp](https://github.com/mstan/ndsrecomp) recompiler walks the code from its entry points and turns each function into a C function: about 2,700 functions for ARM9 and 1,400 for ARM7. One range is marked as data: the ARM9 handler table at `0x027E0000` is referenced like code but is not code.
-3. **Link.** The C compiler builds the generated code together with the framework's DS runtime into `nds_runner`. The runtime provides the memory map, both 2D engines, a melonDS-derived 3D renderer, the sound mixer, DMA, timers, IPC, the 64 KiB EEPROM cartridge save and an SDL3 front end.
+---
 
-## Safety net: guarded native code and the interpreter
+## The build pipeline
 
-Every translated function keeps a copy of the bytes it was built from. Before native code runs at an address, the runtime checks that the same bytes are still in memory. If they are not, for example because the game loaded an overlay there, execution falls back to a bounded interpreter (the "Tier-3" path). The program never runs native code that does not match the bytes in memory.
+```
+ROM ──prepare──▶ arm9.bin / arm7.bin / overlays ──recompiler──▶ C banks
+                                                                    │
+                            runtime (memory, 2D/3D, audio, DMA…) ◀──┘
+                                        │
+                                   nds_runner.exe
+```
 
-On the measured window (boot, title, menu, CONTINUE, 600 frames on the map) the native build made 10,089 ARM9 and 2 ARM7 interpreter dispatches, against 2,483,816 and 1,549,929 when everything is interpreted.
+1. **prepare** (`tools/prepare_dusk.py`) verifies the ROM hash, decompresses
+   the ARM9 image, extracts the ARM7 image and every overlay, and writes
+   `generated/windows/inputs`.
+2. **recompiler** builds `nds_recompile`, which walks each image from its entry
+   points, decodes every reachable function and emits one C function per guest
+   function. Each emitted function is paired with a *validation record*: start
+   address, byte length and a copy of the bytes it was built from.
+3. **banks** splits the generated code into translation units and dispatch
+   tables. Banks exist for the ARM9 main image, each overlay that contains code,
+   and a few relocated ARM7 aliases.
+4. **build** compiles the banks together with the runtime and links
+   `nds_runner.exe`.
 
-## Overlays and coverage promotion
+The result is a normal Windows executable. There is no ROM file open at runtime
+and no cartridge bus to emulate; the ROM is needed only to produce the banks.
 
-DS games load *overlays*, swappable code modules, into fixed memory slots. Dusk has 18. They are not compiled ahead of time yet; they run on the interpreter. Static analysis also misses code reached only through function pointers, and Dusk copies its ARM7 program to other addresses at run time.
+---
 
-[`tools/promote_coverage.py`](../tools/promote_coverage.py) closes these gaps from recorded play. It compiles the addresses that were seen executing into extra banks: ARM7 alias banks at the relocated bases, overlay banks, and pages of code that exist only at run time. In one experiment on the boot flow, ARM7 interpreter dispatches fell from 1,757,551 to 2 and ARM9 from 2,790,951 to 4,409, with identical behaviour.
+## The safety net: bytes must still match
 
-## Boot path
+Self-modifying code and loader-generated code exist on the DS, and a static
+translation cannot know what will be written at run time. Every native function
+therefore carries the bytes it was compiled from. Before native code runs, the
+runtime checks the guest RAM/VRAM contents at that function's address:
 
-The runner uses your real BIOS dumps, a generated firmware image and a direct cartridge boot (`--generated-firmware --boot direct`). The full retail firmware boot currently halts before anything is displayed, so it is not used.
+- **bytes match** → the native function runs;
+- **bytes differ** → the runtime falls back to a small **Tier-3 interpreter**
+  for that region, executing the bytes that are actually there.
 
-## The open problem
+The interpreter is bounded: it only runs guest bytes that were copied into RAM
+by the guest itself (or by a loader), and native code never runs against
+mismatched memory. This is what lets the port survive overlays whose code is
+rewritten after load and functions reached only through computed branches,
+without HLE shortcuts.
 
-After the pack-selection screen of a new game, the ARM9 reaches an invalid Thumb address (`0xFFFFFF70`) and the runner halts with a dispatch miss. The same point is passed in melonDS. The saved evidence rules out some explanations (the table at `0x027E0000` is no longer compiled as a function, and the dispatcher indexes it correctly), but the first point where native execution diverges from the interpreter has not been found. Help is welcome: please open an issue with the runner's log if you investigate it.
+Statistics from the debug interface (`static_coverage`, `tier3_*`) count how
+much of a route goes through that fallback. On the sister Sunburst port, which
+shares this engine and runtime, the share is a few percent of ARM9
+instructions on its measured route; it has not been measured on Dusk yet.
+
+**No HLE.** Nothing in the game's logic — menus, save format, RNG, audio, 3D
+math — is reimplemented by hand. The game's own code runs, native or
+interpreted. That keeps behavior tied to the original binary and makes the port
+verifiable against captured frames.
+
+---
+
+## The runtime
+
+`nds_runner.exe` contains:
+
+| Piece | Source |
+|---|---|
+| ARM9/ARM7 state, scheduler, IRQs, DMA, timers, IPC | `framework/ndsrecomp/runner` |
+| 4 MiB main RAM, shared WRAM, ARM9 ITCM/DTCM, VRAM banks | same |
+| 2D engines A/B (BG, OBJ, windows, blending, mosaic) | same |
+| 3D rasterizer | melonDS-derived, GPL-3.0-or-later |
+| Audio mixer, 16 channels, ADPCM | same |
+| Cartridge/EEPROM, save states | same |
+| SDL3 window, input, audio device, scaling, filters | same |
+| Settings menu, on-screen UI | `framework/recomp-ui` |
+
+The two CPUs run interleaved on one event scheduler and resynchronize on
+hardware events (IPC, shared WRAM, observed I/O), not on frame counts. The
+front end is paced by the audio queue; when the device cannot open, the runner
+still runs but timing changes.
+
+### Firmware and BIOS
+
+The port uses **FreeBIOS** (a BSD-2-Clause clean-room BIOS) and a generated
+firmware image, then boots the cartridge directly. This is why no BIOS dump is
+required. A retail BIOS can still be supplied for LLE development boots
+(`--boot lle`), but it is never needed to play and never shipped.
+
+### Saves
+
+Battery saves are the raw 64 KiB EEPROM image, written to
+`saves\dusk.sav`. Save states are snapshots of the whole machine
+(`savestates\slot-NN.state`), 12 slots. Compatibility with saves from other
+emulators is not guaranteed: the format is the port's own, even when the
+battery image itself is the same bytes the cartridge would see.
+
+---
+
+## Dispatching native code
+
+Every generated bank has a dispatch table keyed by guest address. A native
+function returns the next guest PC; the runtime looks it up:
+
+- hit → call the generated C function;
+- miss inside a validated region → Tier-3 interpreter;
+- miss elsewhere → a dispatch-miss log entry (a bug in the bank, treated as a
+  hard failure in tests).
+
+Dispatch tables are built for whole validated spans, so interior branch targets
+are actual native entry points, not just function starts. This is what allows
+functions to be split by branches and still be fully native.
+
+Overlays are handled the same way: each overlay that contains code gets its own
+bank and validation records. Overlays that are pure data, or whose code is
+rewritten by the loader before execution, have no bank; the interpreter covers
+them, bounded by the byte check.
+
+---
+
+## What is *not* emulated
+
+- **Cartridge protocol / ROM timing.** The ROM is not present at runtime.
+- **Wi-Fi, local wireless, microphone, IR.** Not implemented.
+- **DS firmware UI, PictoChat, Download Play.** Not implemented.
+- **Accurate bus contention / cycle timing.** The scheduler is hardware-event
+  driven, not cycle-stepped; games that rely on precise CPU/RAM contention
+  timing could diverge, though none of the tested route does.
+- **3D edge cases.** The rasterizer is melonDS-derived but not pixel-exact on
+  every state; the tested route exercises little 3D.
+
+---
+
+## Verifying a build
+
+Generate a build, then compare deterministic frame digests at fixed vblank
+counts against a reference run (same save, same inputs). The development
+pipeline records a 64-bit FNV of both screens at every checkpoint; a matching
+digest set means the visible output is byte-identical for that route. The
+project's own release checks use boot-to-title, a field route, menus, save/load
+and savestate restore; the same technique can be used to diff any two builds.

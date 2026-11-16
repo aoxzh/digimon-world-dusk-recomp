@@ -1,95 +1,170 @@
 # Building
 
-There is no release yet, so building from this repository is the only way to run the port. The build has been verified on macOS (Apple silicon). Other hosts have not been tested yet.
+Two supported ways to get a runnable port:
 
-## Requirements
+| Path | Who it is for | What it needs |
+|---|---|---|
+| **Release zip + `play.bat`** | Players | Windows, your ROM, internet on first run |
+| **Checkout + `dusk.py`** | Contributors | Windows (or a POSIX host), your own C toolchain, Python 3.10+ |
 
-| Tool | Notes |
-| --- | --- |
-| git | any recent version |
-| CMake and Ninja | on `PATH` |
-| C/C++ compiler | Apple clang on macOS |
-| SDL3 | e.g. `brew install sdl3`; pass `CMAKE_ARGS="-DSDL3_DIR=…"` if CMake cannot find it |
-| Python | 3.11 or newer, with `pip install -r requirements.txt` (ndspy) |
+Both produce the same executable. Neither needs BIOS dumps.
 
-You also need, from your own hardware and cartridge:
+---
 
-- the ROM, which must match the SHA-1 in the [README](../README.md#status)
-- your DS BIOS dumps `biosnds9.bin` (4 KiB) and `biosnds7.bin` (16 KiB)
+## Path A — release zip (recommended)
 
-No firmware dump is needed: the runner uses a generated firmware image.
+1. Download `dusk-<version>-windows-x64-sources.zip` from Releases and unzip
+   it into a writable directory. Do not use `Program Files`; the build writes
+   beside itself.
+2. Copy your dump to `rom\Digimon World - Dusk (USA).nds`. The
+   SHA-1 must be `de1a1915e07288ffad654f3f9f2eb730a0fd1d9c`.
+3. Run `play.bat`.
 
-## 1. Get the framework
+`play.bat` hands over to `setup_kit.py`, which:
 
-The port builds on [ndsrecomp](https://github.com/mstan/ndsrecomp) and [recomp-ui](https://github.com/mstan/recomp-ui) at the commits pinned in [`framework.lock.json`](../framework.lock.json), plus [`patches/ndsrecomp.patch`](../patches/ndsrecomp.patch):
+1. finds or downloads the private kit under `kit\` (LLVM-MinGW, CMake, Ninja,
+   SDL3, ndspy), verifying every download by SHA-256;
+2. verifies the ROM size and hash;
+3. runs the build phases `prepare` → `recompiler` → `banks` (and `promote` only
+   if coverage manifests are present, which a release never ships) → `build`;
+4. copies the freshly built runner and its three DLLs into `runtime\`;
+5. launches the game.
 
-```bash
-tools/build_dusk.sh fetch
+Everything is logged to `game\build.log`. Later launches compare
+`.ship-id` / `.build-id` and start the existing executable immediately.
+
+Useful switches:
+
+```bat
+python setup_kit.py --dry-run --no-dialog     :: show the plan, build nothing
+python setup_kit.py --rom D:\dumps\dusk.nds --no-dialog
+python setup_kit.py --offline                 :: never download; fail if kit absent
+python setup_kit.py --adopt-runtime           :: use a shipped runtime\ if it matches
+python setup_kit.py --rebuild                 :: ignore caches, build again
+python setup_kit.py --jobs 8                  :: limit parallel compile jobs
 ```
 
-This clones both into `external/` and applies the patch. To do it by hand:
+The kit layout under `kit\` is also what a checkout build expects, so you can
+point a checkout at it with `DUSK_TOOLCHAINS=<unzip>\kit` instead of
+installing a separate toolchain.
 
-```bash
-git clone https://github.com/mstan/ndsrecomp.git external/ndsrecomp
-git -C external/ndsrecomp checkout 3a57236bb23d25dcb4caad7d58d733311062ff5e
-git -C external/ndsrecomp submodule update --init
-git -C external/ndsrecomp apply --whitespace=nowarn ../../patches/ndsrecomp.patch
-git clone https://github.com/mstan/recomp-ui.git external/recomp-ui
-git -C external/recomp-ui checkout 41c88ffea852b970af8d50312620b17404e455ad
+---
+
+## Path B — build from a checkout
+
+### 1. Checkout and ROM
+
+```bat
+git clone https://github.com/aoxzh/digimon-world-dusk-recomp.git
+cd digimon-world-dusk-recomp
 ```
 
-## 2. Build the game
+Put the dump in the repository root, keeping the exact name:
 
-```bash
-export DUSK_ROM="/path/to/Digimon World - Dusk (USA).nds"
-export DUSK_BIOS_DIR="/path/to/your/bios"
-tools/build_dusk.sh all
+```
+Digimon World - Dusk (USA).nds
 ```
 
-`all` runs these steps, each of which can also be run on its own:
+`game.toml` points at it as `../Digimon World - Dusk (USA).nds`
+from `dusk-recomp\`. `*.nds` is git-ignored; never commit it.
 
-| Step | What it does | Output |
-| --- | --- | --- |
-| `prepare` | checks the ROM, extracts ARM9, ARM7 and the 18 ARM9 overlays, writes recompiler configs | `generated/inputs/` |
-| (recompiler) | builds `nds_recompile` once | `external/ndsrecomp/recompiler/build/` |
-| (BIOS, firmware) | recompiles your BIOS dumps; writes empty firmware placeholder banks | `external/ndsrecomp/generated/` |
-| `banks` | recompiles the game: `dusk_arm9` (8 shards) and `dusk_arm7` (4 shards) | `generated/recomp/` |
-| `runner` | compiles the banks with the DS runtime | `build/runner/nds_runner` |
+### 2. Python and ndspy
 
-Everything in `generated/`, `build/`, `run/` and `dist/` is derived from your ROM. `.gitignore` excludes it. Do not commit or share it.
+`prepare` needs Python 3.10+ and [ndspy](https://github.com/RoadrunnerWMC/ndspy):
 
-## 3. Run
-
-```bash
-tools/build_dusk.sh run
+```bat
+python -m pip install ndspy
 ```
 
-The save is `run/dusk.sav` (a 64 KiB EEPROM image), unless `DUSK_SAVE` points elsewhere. A save written by melonDS for this ROM can be used directly; this is currently the only way to get past the start of a new game.
+### 3. Toolchain
 
-## 4. macOS app (optional)
+The build needs CMake, Ninja, LLVM-MinGW (Windows) or a host clang, and the
+SDL3 development package. Discovery order is:
 
-```bash
-tools/package_macos.sh
-open dist/Dusk-Recomp.app --args "$DUSK_ROM"
+1. explicit environment variables: `DUSK_CMAKE`, `DUSK_NINJA`,
+   `LLVM_MINGW_BIN`, `SDL3_ROOT`;
+2. `DUSK_TOOLCHAINS` (a directory laid out like the release `kit\`);
+3. `<repository root>\toolchains`;
+4. `PATH`.
+
+On Windows the release kit is the tested combination (LLVM-MinGW 20261020,
+CMake 4.4.4, Ninja 1.13.2, SDL3 3.4.18). A stock LLVM/Clang install usually
+works but produces a different binary.
+
+### 4. Build
+
+From `dusk-recomp\`:
+
+```bat
+python tools\dusk.py prepare      :: verify ROM, extract ARM9/ARM7/overlays
+python tools\dusk.py recompiler   :: build nds_recompile
+python tools\dusk.py banks        :: emit the title and system banks
+python tools\dusk.py build        :: build nds_runner
 ```
 
-The app keeps saves in `~/Library/Application Support/DuskRecomp/`. Without an argument it looks for `dusk.nds` in that folder. The app contains the translated game and your BIOS dumps, so keep it to yourself.
+Outputs:
 
-## 5. Promote coverage (optional, for developers)
+| Artifact | Location |
+|---|---|
+| Recompiler | `generated\windows\recompiler\nds_recompile.exe` |
+| Runner | `generated\windows\runner\nds_runner.exe` |
+| Extracted inputs | `generated\windows\inputs\` |
+| Generated banks | `generated\windows\recomp\`, `system\` |
 
-The runner can record which interpreted code ran (`--coverage-manifest`). After ingesting those manifests with the framework's `tools/ingest_coverage_manifests.py`, compile them into extra banks:
+Run it interactively:
 
-```bash
-python tools/promote_coverage.py --inputs generated/inputs --seeds <ingest output> \
-    --out generated/promoted --recompiler external/ndsrecomp/recompiler/build/nds_recompile
+```bat
+generated\windows\runner\nds_runner.exe --interactive ^
+  --rom "..\Digimon World - Dusk (USA).nds" ^
+  --config game.toml --generated-firmware --boot direct
 ```
 
-Then reconfigure the runner with the `-DNDS_TITLE_BANK_DIRS` and `-DNDS_TITLE_ROM_SHA1S` values it prints. Merging seeds into the main ARM9 bank (`--promote-main`) currently fails to link and is off by default.
+Useful flags: `--force` on `recompiler`/`build` to rebuild, `--jobs N` to limit
+parallelism, `--software-3d` on `build` when the machine has no usable OpenGL
+compute path.
 
-## Tests
+`python tools\dusk.py status` prints toolchain versions, inputs and artifact
+state.
 
-```bash
-python -m unittest discover -s tests -v
+### 5. Mods (optional)
+
+```bat
+python tools\dusk.py mods list
+python tools\dusk.py mods apply --patch mods\translation\my.ips --out ..\patched.nds
+python tools\dusk.py prepare --patched-rom ..\patched.nds --accept-patched-identity
 ```
 
-These checks need no ROM. They verify the config, the framework pins and that no game data or personal paths are committed. CI also checks that the framework patch still applies to the pinned commit.
+A patched build only accepts that exact patched ROM; the retail dump is refused
+afterwards. See [MODS.md](../dusk-recomp/docs/MODS.md).
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `ROM ... does not match` | Not the USA revision 0 dump, or patched/trimmed. Check the SHA-1. |
+| `no Python` on first run | `play.bat` falls back to `bootstrap_python.ps1`; allow it, or install Python 3.10+ and delete `kit\python`. |
+| `missing VCRUNTIME140.dll` | A system Python was used instead of the kit's. Install the Microsoft VC++ 2015–2022 x64 redistributable, or delete `kit\python` so the bootstrap fetches a self-contained copy. |
+| SmartScreen warning | The executable is unsigned. "More info" → "Run anyway", or build it yourself from source. |
+| Build stops on a missing compiler | Install the kit (run the release zip once) and set `DUSK_TOOLCHAINS`, or install CMake/Ninja/LLVM/SDL3 and put them on `PATH`. |
+| Antivirus quarantines the runner | Common with fresh unsigned binaries and self-built executables; allow the folder or build from source. |
+| Build fails after moving the folder | Generated build files contain absolute paths. Delete `dusk-recomp\generated\` and `game\build\` (release shape), then rebuild. |
+| No sound | Check `settings.ini` (`audio.enabled=1`, `audio.volume=100`) and the Esc menu. Audio is the frame clock; if the device fails to open, the game still runs but pacing changes. |
+| Stutter in the first seconds | Expected: the audio queue and asset streaming warm up during boot. |
+
+Logs from the first-start kit are in `game\build.log`; runtime logs are in
+`logs\`. A bug report is much easier to act on with the ROM SHA-1, the toolchain
+versions from `python tools\dusk.py status`, and the log around the failure.
+
+---
+
+## Notes
+
+- `generated\` is build output and is never committed. Do not hand-edit it;
+  fix the recompiler, the runtime or the config instead.
+- A built `nds_runner.exe` links GPL-3.0-or-later framework components; it is a
+  GPL combined work. See [LICENSE](../LICENSE) and
+  [THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES.md).
+- The vendored framework is pinned by this repository; updating it means
+  updating `framework/` and re-running the build, not editing generated code.

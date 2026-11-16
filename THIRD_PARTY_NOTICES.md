@@ -1,42 +1,73 @@
 # Third-party notices
 
-This project is a thin layer on top of other people's work. This file lists
-what the repository uses and under which license. It is an attribution record,
-not legal advice.
+This repository is source code and documentation plus a vendored development
+framework. It contains **no game ROM, BIOS dump, firmware image, save file or
+recompiled game code**, and releases do not either. You must supply your own
+dump of *Digimon World: Dusk (USA)*.
 
-## Never distributed
+The permissive MIT grant in [LICENSE](LICENSE) applies only to this project's
+original tooling and documentation. Everything below keeps its own license.
 
-The game ROM, Nintendo DS BIOS dumps and DS firmware images are copyrighted
-data. They are not in this repository. The build reads your own files on your
-own computer; everything it produces (`generated/`, `build/`, `run/`, `dist/`)
-contains translated game code and must not be shared.
+## Vendored in this repository
 
-## What the build uses
+| Component | Version / pin | License | Location |
+|---|---|---|---|
+| ndsrecomp | 0.6.10 | PolyForm Noncommercial 1.0.0; MIT portions; GPL-3.0-or-later for melonDS-derived files | `framework/ndsrecomp/` |
+| arm-recomp-core | bundled with ndsrecomp | MIT | `framework/ndsrecomp/external/arm-recomp-core/` |
+| melonDS-derived GPU/rasterizer code | bundled with ndsrecomp | GPL-3.0-or-later | `framework/ndsrecomp/runner/vendor/melonds/` |
+| FreeBIOS | 2013 clean-room BIOS | BSD-2-Clause | `framework/ndsrecomp/third_party/freebios/` |
+| recomp-ui | matching framework pin | MIT | `framework/recomp-ui/` |
+| Dear ImGui | bundled with recomp-ui | MIT | `framework/recomp-ui/src/third_party/imgui/` |
+| toml++ | 3.4.0 | MIT | `framework/ndsrecomp/recompiler/third_party/toml.hpp` |
 
-| Component | Version | License | How it is used |
-| --- | --- | --- | --- |
-| This project (build tools, config, docs, tests) | see `VERSION` | MIT (`LICENSE`) | this repository |
-| [ndsrecomp](https://github.com/mstan/ndsrecomp) framework | commit `3a57236`, plus `patches/ndsrecomp.patch` | Split: PolyForm Noncommercial 1.0.0 for project-owned code; MIT for `runner/src/` (except `melonds_compute/` and `frontend.cpp`), `recompiler/armv4t/`, `recompiler/support/`; GPL-3.0-or-later for melonDS-derived parts and `runner/src/frontend.cpp` | cloned by `tools/build_dusk.sh fetch` |
-| [recomp-ui](https://github.com/mstan/recomp-ui) | commit `41c88ff` | MIT | cloned by `tools/build_dusk.sh fetch` |
-| [arm-recomp-core](https://github.com/mstan/arm-recomp-core) | framework submodule | MIT | inside the framework |
-| [FreeBIOS](https://github.com/mstan/freebios) | framework submodule | BSD-2-Clause | inside the framework |
-| [melonDS](https://melonds.kuribo64.net/) GPU3D and related code (vendored in ndsrecomp) | 1.0rc | GPL-3.0-or-later | inside the framework |
-| [SDL3](https://libsdl.org/) | 3.x | zlib | installed by you |
-| [ndspy](https://github.com/RoadrunnerWMC/ndspy) | 4.2.0 | GPL-3.0 | `pip install -r requirements.txt` |
+The framework keeps its full license texts and per-component provenance:
+`framework/ndsrecomp/LICENSE`, `LICENSE-MIT`, `LICENSE-GPL`,
+`THIRD_PARTY_ATTRIBUTION.md`, `third_party/freebios/LICENSE.txt`,
+`external/arm-recomp-core/LICENSE`, and `framework/recomp-ui/LICENSE`.
 
-### What the license split means for you
+`framework/ndsrecomp/third_party/freebios/` includes two small FreeBIOS
+binaries (`drastic_bios_arm7.bin`, 16,384 bytes, and `drastic_bios_arm9.bin`,
+4,096 bytes). They are part of the upstream BSD-2-Clause FreeBIOS distribution,
+not Nintendo BIOS dumps.
 
-* The framework's project-owned code is **PolyForm Noncommercial**, so this
-  whole port is for **noncommercial use only**.
-* The `nds_runner` you build links GPL-3.0 parts, so it is a GPL-3.0-or-later
-  combined work.
-* `patches/ndsrecomp.patch` changes framework files and stays under the license
-  of each file it touches. It is the same patch used by
-  [Digimon Super Xros Wars Recomp](https://github.com/aoxzh/digimon-super-xros-wars-recomp).
+## Downloaded by the build kit (not in this repository)
 
-## Thanks
+The first-start kit fetches these into its private `kit/` directory, verifying
+each download by SHA-256. They are not part of this repository and are governed
+by their own licenses.
 
-The ndsrecomp, recomp-ui, arm-recomp-core and FreeBIOS projects (Matthew
-Stanley and contributors); Metroid Prime Hunters Recomp, whose ROM-preparation
-script this port's is adapted from; melonDS (Arisotura and contributors);
-GBATEK (Martin Korth); and ndspy for DS file-format knowledge.
+| Component | Version | License |
+|---|---|---|
+| LLVM-MinGW | 20261020 (UCRT x86_64) | Apache-2.0 with LLVM exceptions |
+| CMake | 4.4.4 | BSD-3-Clause |
+| Ninja | 1.13.2 | Apache-2.0 |
+| SDL3 (development package) | 3.4.18 | zlib |
+| CPython (python-build-standalone) | 3.12 | PSF-2.0 |
+| ndspy | 4.2.0 | GPL-3.0 |
+
+## Built artifacts
+
+A built `nds_runner.exe` links the vendored melonDS-derived GPU code through
+ndsrecomp, so it is a **GPL-3.0-or-later combined work**. If you share a built
+binary, share it under GPL-3.0-or-later with the corresponding source, and never
+bundle it with the ROM, BIOS, firmware, saves or generated game code.
+
+The sources-only release archive contains only this repository's source,
+scripts, configuration, documentation and vendored framework. It contains no
+game data and no compiled runner; the first start builds the runner locally.
+
+## Attribution
+
+- ndsrecomp and recomp-ui: Matthew Stanley.
+- melonDS: the melonDS project (GPL-3.0-or-later).
+- FreeBIOS: Gilead Kutnick and contributors (BSD-2-Clause).
+- ndspy: RoadrunnerWMC and contributors (GPL-3.0).
+- SDL3: Sam Lantinga and contributors (zlib).
+- LLVM-MinGW: Martin Storsjö and the LLVM project.
+- CMake, Ninja, CPython, Dear ImGui and their contributors.
+- GBATEK and the NDS reverse-engineering community for hardware documentation.
+
+*Digimon World: Dusk* and all related names, characters and assets are
+trademarks or copyrights of Bandai Namco Entertainment, Toei Animation and
+their respective rights holders. This is an unofficial fan project, not
+affiliated with or endorsed by them.

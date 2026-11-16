@@ -1,0 +1,62 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  sources:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile every Python tool
+        shell: bash
+        run: |
+          python -m py_compile $(git ls-files '*.py')
+
+      - name: Build the sources archive
+        shell: bash
+        run: |
+          version="$(cat VERSION)"
+          python dusk-recomp/tools/package_release.py \
+            --no-runner --version "$version" --out dist
+
+      - name: Audit the sources archive
+        shell: bash
+        run: python scripts/audit_archive.py dist/*-sources.zip
+
+      - name: Write the checksum
+        shell: bash
+        run: |
+          cd dist
+          for f in *.zip; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -l
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sources-release
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Create the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Digimon World: Dusk Recomp $GITHUB_REF_NAME" \
+            --notes-file docs/RELEASE_NOTES.md \
+            --draft \
+            dist/*.zip dist/*.zip.sha256 dist/*.manifest.txt

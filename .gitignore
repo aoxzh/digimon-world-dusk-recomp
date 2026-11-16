@@ -1,20 +1,45 @@
-# Build output and caches. Anything built from a ROM contains translated game
-# code and must never be committed.
-/external/
-/build/
-/generated/
-/run/
-/dist/
-/.venv/
-__pycache__/
-*.pyc
-.DS_Store
-
-# Game and console data never enters this repository.
+# Game data — never commit
 *.nds
 *.sav
 *.dsv
-bios*.bin
+*.state
+saves/
+savestates/
+rom/*
+!rom/PUT-YOUR-ROM-HERE.txt
 bios*.rom
+bios*.bin
 firmware*.bin
-dsfirmware.bin
+
+# Build and generated output
+dusk-recomp/generated/
+dusk-recomp/run/
+dusk-recomp/config/perf-ab*.json
+generated/
+build/
+dist/
+game/
+runtime/
+kit/
+toolchains/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.o
+*.a
+*.ilk
+*.exp
+
+# Toolchain caches and editor files
+__pycache__/
+*.pyc
+.cache/
+.vs/
+.vscode/
+.idea/
+CMakeFiles/
+CMakeCache.txt
+*.log
+logs/

@@ -1,31 +1,6 @@
-Scope note
-==========
-
-The MIT grant below covers ONLY the files that belong to this project: the
-build and packaging tools, the configuration, the documentation
-and the tests in this repository.
-
-It does not cover, and does not relicense:
-
-  * the game "Digimon World: Dusk", any Nintendo DS ROM image,
-    BIOS or firmware image (none of which are distributed here);
-  * the ndsrecomp framework (https://github.com/mstan/ndsrecomp), which has its
-    own license split: PolyForm Noncommercial 1.0.0 for project-owned code,
-    plus MIT and GPL-3.0 parts including vendored melonDS sources. The file
-    patches/ndsrecomp.patch modifies framework files and stays under the
-    license of each file it touches;
-  * recomp-ui (MIT) and the other third-party components listed in
-    THIRD_PARTY_NOTICES.md.
-
-An nds_runner built with this project links GPL-3.0 parts of the framework
-and is therefore a GPL-3.0-or-later combined work. Because the framework is
-noncommercial-only, so is the port as a whole.
-
-------------------------------------------------------------------------------
-
 MIT License
 
-Copyright (c) 2026 the Digimon World Dusk Recomp contributors
+Copyright (c) 2026 the dusk-recomp contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -44,3 +19,38 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+## Scope
+
+This license covers only the original title-project tooling and documentation
+in this repository: `dusk-recomp/tools/`, `dusk-recomp/game.toml`,
+`dusk-recomp/config/`, `docs/`, the root `README.md` and
+`README.zh-CN.md`, and the CI configuration.
+
+It does not cover the game. No ROM, BIOS dump, firmware image, save file or
+generated recompiled game code is distributed with this repository, and none
+may be redistributed as part of it. You must supply your own dump of
+*Digimon World: Dusk (USA)*. *Digimon Story* and its assets are
+the property of their respective rights holders; this project is not
+affiliated with or endorsed by them.
+
+It does not cover the vendored framework either. `framework/ndsrecomp`
+(ndsrecomp 0.6.10) is copyright (c) 2026 Matthew Stanley and is licensed under
+the PolyForm Noncommercial License 1.0.0, with portions under the MIT License
+and melonDS-derived files under GPL-3.0-or-later; see
+`framework/ndsrecomp/LICENSE`, `LICENSE-MIT`, `LICENSE-GPL` and
+`THIRD_PARTY_ATTRIBUTION.md`. `framework/recomp-ui` is MIT, copyright (c) 2026
+Matthew Stanley. FreeBIOS, used for the FreeBIOS banks, is BSD-2-Clause. Other
+vendored components keep their own terms; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Nothing here grants rights to
+those components beyond what their own terms allow.
+
+Note that a built `nds_runner.exe` is a GPL-3.0-or-later combined work, because
+it links the vendored melonDS GPU code through the framework. Distributing that
+binary is subject to GPL-3.0-or-later, not to the MIT license above.
+
+The port uses FreeBIOS and a generated firmware image, so a BIOS dump is not
+required to build or play. A retail BIOS may optionally be supplied for
+low-level development boots.

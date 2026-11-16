@@ -1,0 +1,6119 @@
+#include "frontend.h"
+#include "host_profile.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <cstdint>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <initializer_list>
+#include <limits>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "debug_server.h"
+#include "diagnostics.h"
+#include "display_filters.h"
+#include "gpu2d.h"
+#include "gpu3d.h"
+#include "melonds_compute/TextureUpscale.h"
+#include "io.h"
+#include "profile_report.h"
+#include "relative_mouse_touch.h"
+#include "runtime_arm.h"
+#include "scheduler.h"
+#include "savestate_slots.h"
+#include "spu.h"
+#include "title_patches.h"
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+#include "melonds_compute/ComputeHost.h"
+#endif
+
+namespace {
+// Written per presented frame by the frontend loop, read from the same
+// thread by the `frontend_stats` debug command at the debug_pump() safe
+// point. Stays all-zero (active=0) when no frontend is running.
+NdsFrontendLiveStats g_live_stats{};
+NdsFrontendBlackBandCapture g_black_band{};
+NdsFrontendInputDebugState g_input_debug{};
+// Pending "write the window to a BMP" requests from the play-mode debug
+// surface. The guest framebuffer never contains host overlays (the settings
+// menu is composed into the presented pixels after the guest frame is
+// finished), so a window readback at the next present is the only way to record
+// that an overlay drew.
+std::atomic<int> g_forced_shots{0};
+
+// Peek-then-consume so a two-window presentation can write both screens for
+// one request: the first window peeks, the last one consumes.
+bool take_forced_shot(bool consume = true) {
+    if (g_forced_shots.load(std::memory_order_relaxed) <= 0) return false;
+    if (consume) g_forced_shots.fetch_sub(1, std::memory_order_relaxed);
+    return true;
+}
+
+// ---- Presented-frame digest ring (frontend.h) ----------------------------
+constexpr uint32_t kFrameDigestRing = 8192;   // ~136 s at 60 fps
+NdsFrontendFrameDigest g_frame_digests[kFrameDigestRing];
+std::atomic<uint64_t> g_frame_digest_count{0};
+// Incremented on every successful savestate LOAD. Two processes launched
+// independently present a different number of frames before the load lands, so
+// the epoch, not the frame index, is what aligns their digest streams.
+uint32_t g_frame_digest_epoch = 0;
+// Latched once, at the first present, from the environment: the ring covers
+// the whole process life or none of it. Never armed by a probe.
+int g_frame_digest_enabled = -1;
+
+bool frame_digest_enabled() {
+    if (g_frame_digest_enabled < 0) {
+        const char* const value = std::getenv("NDS_FRAME_HASH");
+        g_frame_digest_enabled =
+            (value && value[0] == '1' && value[1] == '\0') ? 1 : 0;
+    }
+    return g_frame_digest_enabled != 0;
+}
+
+// FNV-1a over 32-bit words. Chosen for being trivially reproducible from a
+// Python-side reimplementation, not for cryptographic strength.
+uint64_t digest_words(const uint32_t* words, size_t count, uint64_t seed) {
+    uint64_t h = seed;
+    for (size_t i = 0; i < count; ++i) {
+        h ^= words[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+void record_frame_digest(uint64_t frame, const uint32_t* top, uint32_t top_w,
+                         const uint32_t* bottom, uint32_t bottom_w,
+                         bool direct_present) {
+    if (!frame_digest_enabled()) return;
+    NdsGpu2dHdFrame hd{};
+    const bool have_hd = nds_gpu2d_hd_frame_peek(&hd);
+    NdsFrontendFrameDigest entry{};
+    entry.frame = frame;
+    entry.top_width = top_w;
+    entry.bottom_width = bottom_w;
+    entry.flags = (direct_present ? NDS_FRAME_DIGEST_DIRECT_PRESENT : 0u) |
+                  (have_hd ? NDS_FRAME_DIGEST_HD : 0u);
+    entry.epoch = g_frame_digest_epoch;
+    // On a direct-present frame the top surface lives on the GPU and
+    // `top_pixels` is still the 256-wide native framebuffer, while `top_width`
+    // has already been widened for the presenter's geometry. Hashing top_width
+    // words would read past the native buffer.
+    const uint32_t top_hash_width = direct_present ? 256u : top_w;
+    if (top)
+        entry.top_hash = digest_words(
+            top, static_cast<size_t>(top_hash_width) * 192u,
+            1469598103934665603ull);
+    if (bottom)
+        entry.bottom_hash = digest_words(
+            bottom, static_cast<size_t>(bottom_w) * 192u,
+            1469598103934665603ull);
+    if (have_hd && hd.top_pixels && hd.below_pixels) {
+        const size_t words = static_cast<size_t>(hd.width) * 192u * 2u;
+        uint64_t h = digest_words(hd.top_pixels, words,
+                                  1469598103934665603ull);
+        h = digest_words(hd.below_pixels, words, h);
+        const uint32_t tail[7] = {
+            hd.width, hd.priority_3d, hd.order_3d, hd.bldcnt,
+            hd.master_bright,
+            static_cast<uint32_t>(hd.eva) | (uint32_t{hd.evb} << 8) |
+                (uint32_t{hd.evy} << 16),
+            hd.render_xpos,
+        };
+        entry.hd_hash = digest_words(tail, 7, h);
+    }
+    const uint64_t index =
+        g_frame_digest_count.load(std::memory_order_relaxed);
+    g_frame_digests[index % kFrameDigestRing] = entry;
+    g_frame_digest_count.store(index + 1, std::memory_order_release);
+}
+
+void observe_top_black_bands(const uint32_t* pixels, uint64_t frame) {
+    if (!g_black_band.enabled || !pixels) return;
+    ++g_black_band.scanned_frames;
+
+    uint32_t current_start = 0;
+    uint32_t current_rows = 0;
+    uint32_t longest_start = 0;
+    uint32_t longest_rows = 0;
+    for (uint32_t y = 0; y < 192; ++y) {
+        uint32_t black_pixels = 0;
+        for (uint32_t x = 0; x < 256; ++x) {
+            if ((pixels[y * 256 + x] & 0x00FFFFFFu) == 0)
+                ++black_pixels;
+        }
+        if (black_pixels >= 252) {
+            if (current_rows == 0) current_start = y;
+            ++current_rows;
+            if (current_rows > longest_rows) {
+                longest_start = current_start;
+                longest_rows = current_rows;
+            }
+        } else {
+            current_rows = 0;
+        }
+    }
+
+    // Ignore an intentional full-screen fade. The reported artifact is a
+    // partial band surrounded by otherwise-published image rows.
+    if (longest_rows < 8 || longest_rows >= 192) return;
+    ++g_black_band.band_frames;
+    if (longest_rows <= g_black_band.worst_row_count) return;
+    g_black_band.has_capture = 1;
+    g_black_band.worst_frame = frame;
+    g_black_band.worst_system_timestamp = scheduler_system_timestamp();
+    g_black_band.worst_start_row = longest_start;
+    g_black_band.worst_row_count = longest_rows;
+    std::memcpy(g_black_band.top_pixels, pixels,
+                sizeof(g_black_band.top_pixels));
+}
+}  // namespace
+
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+#define SDL_MAIN_HANDLED
+#if defined(NDS_HAVE_SDL3)
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
+#else
+#include <SDL.h>
+#endif
+#include "recomp_runtime_ui.h"
+
+namespace {
+
+#if defined(NDS_HAVE_SDL3)
+#undef SDL_GameController
+#undef SDL_GameControllerButton
+#undef SDL_GameControllerClose
+#undef SDL_GameControllerGetAxis
+#undef SDL_GameControllerName
+#undef SDL_GameControllerOpen
+#undef SDL_CONTROLLER_AXIS_LEFTX
+#undef SDL_CONTROLLER_AXIS_LEFTY
+#undef SDL_CONTROLLER_AXIS_RIGHTX
+#undef SDL_CONTROLLER_AXIS_RIGHTY
+#undef SDL_CONTROLLER_AXIS_TRIGGERLEFT
+#undef SDL_CONTROLLER_AXIS_TRIGGERRIGHT
+#undef SDL_CONTROLLER_BUTTON_A
+#undef SDL_CONTROLLER_BUTTON_B
+#undef SDL_CONTROLLER_BUTTON_BACK
+#undef SDL_CONTROLLER_BUTTON_DPAD_DOWN
+#undef SDL_CONTROLLER_BUTTON_DPAD_LEFT
+#undef SDL_CONTROLLER_BUTTON_DPAD_RIGHT
+#undef SDL_CONTROLLER_BUTTON_DPAD_UP
+#undef SDL_CONTROLLER_BUTTON_INVALID
+#undef SDL_CONTROLLER_BUTTON_LEFTSHOULDER
+#undef SDL_CONTROLLER_BUTTON_LEFTSTICK
+#undef SDL_CONTROLLER_BUTTON_RIGHTSHOULDER
+#undef SDL_CONTROLLER_BUTTON_RIGHTSTICK
+#undef SDL_CONTROLLER_BUTTON_START
+#undef SDL_CONTROLLER_BUTTON_X
+#undef SDL_CONTROLLER_BUTTON_Y
+#undef SDL_CONTROLLERBUTTONDOWN
+#undef SDL_CONTROLLERBUTTONUP
+#undef SDL_CONTROLLERDEVICEADDED
+#undef SDL_CONTROLLERDEVICEREMOVED
+#undef SDL_KEYDOWN
+#undef SDL_KEYUP
+#undef SDL_MOUSEBUTTONDOWN
+#undef SDL_MOUSEBUTTONUP
+#undef SDL_MOUSEMOTION
+#undef SDL_QUIT
+#undef SDL_FALSE
+#undef SDL_TRUE
+#undef SDL_INIT_GAMECONTROLLER
+#undef SDL_ScaleModeNearest
+#undef SDL_WINDOW_ALLOW_HIGHDPI
+#undef AUDIO_S16SYS
+#define SDL_GameController SDL_Gamepad
+#define SDL_GameControllerButton SDL_GamepadButton
+#define SDL_GameControllerClose SDL_CloseGamepad
+#define SDL_GameControllerGetAxis SDL_GetGamepadAxis
+#define SDL_GameControllerName SDL_GetGamepadName
+#define SDL_GameControllerOpen SDL_OpenGamepad
+#define SDL_CONTROLLER_AXIS_LEFTX SDL_GAMEPAD_AXIS_LEFTX
+#define SDL_CONTROLLER_AXIS_LEFTY SDL_GAMEPAD_AXIS_LEFTY
+#define SDL_CONTROLLER_AXIS_RIGHTX SDL_GAMEPAD_AXIS_RIGHTX
+#define SDL_CONTROLLER_AXIS_RIGHTY SDL_GAMEPAD_AXIS_RIGHTY
+#define SDL_CONTROLLER_AXIS_TRIGGERLEFT SDL_GAMEPAD_AXIS_LEFT_TRIGGER
+#define SDL_CONTROLLER_AXIS_TRIGGERRIGHT SDL_GAMEPAD_AXIS_RIGHT_TRIGGER
+#define SDL_CONTROLLER_BUTTON_A SDL_GAMEPAD_BUTTON_SOUTH
+#define SDL_CONTROLLER_BUTTON_B SDL_GAMEPAD_BUTTON_EAST
+#define SDL_CONTROLLER_BUTTON_BACK SDL_GAMEPAD_BUTTON_BACK
+#define SDL_CONTROLLER_BUTTON_DPAD_DOWN SDL_GAMEPAD_BUTTON_DPAD_DOWN
+#define SDL_CONTROLLER_BUTTON_DPAD_LEFT SDL_GAMEPAD_BUTTON_DPAD_LEFT
+#define SDL_CONTROLLER_BUTTON_DPAD_RIGHT SDL_GAMEPAD_BUTTON_DPAD_RIGHT
+#define SDL_CONTROLLER_BUTTON_DPAD_UP SDL_GAMEPAD_BUTTON_DPAD_UP
+#define SDL_CONTROLLER_BUTTON_INVALID SDL_GAMEPAD_BUTTON_INVALID
+#define SDL_CONTROLLER_BUTTON_LEFTSHOULDER SDL_GAMEPAD_BUTTON_LEFT_SHOULDER
+#define SDL_CONTROLLER_BUTTON_LEFTSTICK SDL_GAMEPAD_BUTTON_LEFT_STICK
+#define SDL_CONTROLLER_BUTTON_RIGHTSHOULDER SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER
+#define SDL_CONTROLLER_BUTTON_RIGHTSTICK SDL_GAMEPAD_BUTTON_RIGHT_STICK
+#define SDL_CONTROLLER_BUTTON_START SDL_GAMEPAD_BUTTON_START
+#define SDL_CONTROLLER_BUTTON_X SDL_GAMEPAD_BUTTON_WEST
+#define SDL_CONTROLLER_BUTTON_Y SDL_GAMEPAD_BUTTON_NORTH
+#define SDL_CONTROLLERBUTTONDOWN SDL_EVENT_GAMEPAD_BUTTON_DOWN
+#define SDL_CONTROLLERBUTTONUP SDL_EVENT_GAMEPAD_BUTTON_UP
+#define SDL_CONTROLLERDEVICEADDED SDL_EVENT_GAMEPAD_ADDED
+#define SDL_CONTROLLERDEVICEREMOVED SDL_EVENT_GAMEPAD_REMOVED
+#define SDL_KEYDOWN SDL_EVENT_KEY_DOWN
+#define SDL_KEYUP SDL_EVENT_KEY_UP
+#define SDL_MOUSEBUTTONDOWN SDL_EVENT_MOUSE_BUTTON_DOWN
+#define SDL_MOUSEBUTTONUP SDL_EVENT_MOUSE_BUTTON_UP
+#define SDL_MOUSEMOTION SDL_EVENT_MOUSE_MOTION
+#define SDL_FINGERDOWN SDL_EVENT_FINGER_DOWN
+#define SDL_FINGERMOTION SDL_EVENT_FINGER_MOTION
+#define SDL_FINGERUP SDL_EVENT_FINGER_UP
+#define SDL_QUIT SDL_EVENT_QUIT
+#define SDL_FALSE false
+#define SDL_TRUE true
+#define SDL_INIT_GAMECONTROLLER SDL_INIT_GAMEPAD
+#define SDL_ScaleModeNearest SDL_SCALEMODE_NEAREST
+#define SDL_WINDOW_ALLOW_HIGHDPI SDL_WINDOW_HIGH_PIXEL_DENSITY
+#define AUDIO_S16SYS SDL_AUDIO_S16
+#else
+#define SDL_EVENT_WINDOW_CLOSE_REQUESTED SDL_WINDOWEVENT_CLOSE
+#define SDL_EVENT_WINDOW_FOCUS_GAINED SDL_WINDOWEVENT_FOCUS_GAINED
+#define SDL_EVENT_WINDOW_FOCUS_LOST SDL_WINDOWEVENT_FOCUS_LOST
+#define SDL_EVENT_WINDOW_MOUSE_LEAVE SDL_WINDOWEVENT_LEAVE
+#endif
+
+constexpr int kScreenWidth = 256;
+constexpr int kScreenHeight = 192;
+// Single-screen ("side panel") layout: the top screen stays at native size on
+// the left, with the touch screen as a readable 160x120 side panel. The canvas
+// is 448x192 (21:9); on a 16:9 display it letterboxes vertically instead of
+// covering the field or the dialogue box.
+constexpr int kSingleCanvasWidth = 448;
+constexpr int kSingleBottomWidth = 160;
+constexpr int kSingleBottomHeight = 120;
+constexpr int kSingleBottomY = (kScreenHeight - kSingleBottomHeight) / 2;
+constexpr int kVirtualControlsHeight = 96;
+constexpr int kSingleLandscapeHeight = kScreenHeight + kVirtualControlsHeight;
+constexpr int kSinglePortraitWidth = kScreenWidth;
+constexpr int kSinglePortraitHeight =
+    kScreenHeight * 2 + kVirtualControlsHeight;
+// Fold-aware layout uses the window aspect ratio so the hinge line maps
+// exactly onto the logical canvas. 480 matches the portrait canvas height and
+// keeps touch/panel sizes in familiar units.
+constexpr int kFoldCanvasHeight = 480;
+constexpr int kFoldCanvasMaxWidth = 1280;
+
+// Android posture state, written by nds_frontend_set_fold_state() and read by
+// the frontend loop under the serial. Permille fractions avoid depending on
+// SDL window coordinates at JNI time.
+std::atomic<uint64_t> g_fold_serial{0};
+std::atomic<int> g_fold_left_permille{0};
+std::atomic<int> g_fold_top_permille{0};
+std::atomic<int> g_fold_right_permille{0};
+std::atomic<int> g_fold_bottom_permille{0};
+std::atomic<int> g_fold_orientation{0};
+std::atomic<bool> g_fold_separating{false};
+
+enum class MphPrimeInputKind : uint8_t {
+    None,
+    Key,
+    Mouse,
+};
+
+struct MphPrimeBinding {
+    MphPrimeInputKind kind = MphPrimeInputKind::None;
+    SDL_Scancode key = SDL_SCANCODE_UNKNOWN;
+    uint8_t mouse = 0;
+};
+
+enum class MphPrimeAction : uint8_t {
+    MoveForward,
+    MoveBack,
+    MoveLeft,
+    MoveRight,
+    Jump,
+    MorphBall,
+    BoostZoom,
+    ScanVisor,
+    UiLeft,
+    UiRight,
+    UiOk,
+    Shoot,
+    ScanShoot,
+    Beam,
+    Missile,
+    Weapon1,
+    Weapon2,
+    Weapon3,
+    Weapon4,
+    Weapon5,
+    Weapon6,
+    VirtualStylus,
+    Menu,
+    Count,
+};
+
+struct MphPrimeBindingSet {
+    std::array<MphPrimeBinding,
+               static_cast<size_t>(MphPrimeAction::Count)> bindings{};
+    bool valid = true;
+};
+
+struct MphTouchStep {
+    uint16_t x = 0;
+    uint16_t y = 0;
+    bool down = false;
+    uint8_t frames = 0;
+};
+
+struct MphTouchSequence {
+    std::array<MphTouchStep, 6> steps{};
+    uint8_t count = 0;
+    uint8_t index = 0;
+    uint8_t remaining = 0;
+
+    bool active() const { return index < count; }
+
+    void start(std::initializer_list<MphTouchStep> source) {
+        count = static_cast<uint8_t>(
+            std::min(source.size(), steps.size()));
+        std::copy_n(source.begin(), count, steps.begin());
+        index = 0;
+        remaining = count ? steps[0].frames : 0;
+    }
+
+    void tick() {
+        if (!active()) return;
+        const MphTouchStep& step = steps[index];
+        nds_set_touch(step.x, step.y, step.down);
+        if (remaining > 0) --remaining;
+        if (remaining == 0) {
+            ++index;
+            if (active()) remaining = steps[index].frames;
+        }
+    }
+};
+
+std::string binding_name_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) {
+                       if (c == '_' || c == '-') return ' ';
+                       return static_cast<char>(std::tolower(c));
+                   });
+    while (!value.empty() && value.front() == ' ') value.erase(value.begin());
+    while (!value.empty() && value.back() == ' ') value.pop_back();
+    return value;
+}
+
+SDL_Scancode scancode_from_binding_name(const std::string& value) {
+    const std::string normalized = binding_name_lower(value);
+    SDL_Scancode key = SDL_GetScancodeFromName(value.c_str());
+    if (key != SDL_SCANCODE_UNKNOWN)
+        return key;
+    if (normalized.size() == 1) {
+        const char c = normalized[0];
+        if (c >= 'a' && c <= 'z') {
+            return static_cast<SDL_Scancode>(
+                SDL_SCANCODE_A + (c - 'a'));
+        }
+        if (c >= '1' && c <= '9') {
+            return static_cast<SDL_Scancode>(
+                SDL_SCANCODE_1 + (c - '1'));
+        }
+        if (c == '0')
+            return SDL_SCANCODE_0;
+    }
+    if (normalized == "ctrl" || normalized == "control" ||
+        normalized == "left ctrl" || normalized == "left control") {
+        return SDL_SCANCODE_LCTRL;
+    }
+    if (normalized == "right ctrl" || normalized == "right control")
+        return SDL_SCANCODE_RCTRL;
+    if (normalized == "shift" || normalized == "left shift")
+        return SDL_SCANCODE_LSHIFT;
+    if (normalized == "right shift")
+        return SDL_SCANCODE_RSHIFT;
+    if (normalized == "space")
+        return SDL_SCANCODE_SPACE;
+    if (normalized == "tab")
+        return SDL_SCANCODE_TAB;
+    if (normalized == "enter" || normalized == "return")
+        return SDL_SCANCODE_RETURN;
+    if (normalized == "backspace")
+        return SDL_SCANCODE_BACKSPACE;
+    return SDL_SCANCODE_UNKNOWN;
+}
+
+MphPrimeBinding parse_mph_prime_binding(const std::string& value) {
+    const std::string normalized = binding_name_lower(value);
+    if (normalized.empty() || normalized == "none" ||
+        normalized == "unbound") {
+        return {};
+    }
+    if (normalized == "mouse left" || normalized == "left mouse")
+        return {MphPrimeInputKind::Mouse, SDL_SCANCODE_UNKNOWN,
+                SDL_BUTTON_LEFT};
+    if (normalized == "mouse right" || normalized == "right mouse")
+        return {MphPrimeInputKind::Mouse, SDL_SCANCODE_UNKNOWN,
+                SDL_BUTTON_RIGHT};
+    if (normalized == "mouse middle" || normalized == "middle mouse")
+        return {MphPrimeInputKind::Mouse, SDL_SCANCODE_UNKNOWN,
+                SDL_BUTTON_MIDDLE};
+    if (normalized == "mouse 4")
+        return {MphPrimeInputKind::Mouse, SDL_SCANCODE_UNKNOWN,
+                SDL_BUTTON_X1};
+    if (normalized == "mouse 5")
+        return {MphPrimeInputKind::Mouse, SDL_SCANCODE_UNKNOWN,
+                SDL_BUTTON_X2};
+
+    SDL_Scancode key = scancode_from_binding_name(value);
+    return {key == SDL_SCANCODE_UNKNOWN ? MphPrimeInputKind::None
+                                        : MphPrimeInputKind::Key,
+            key, 0};
+}
+
+// ── Gamepad bindings for Prime Controls actions ─────────────────────────
+enum class MphPadInputKind : uint8_t {
+    None,
+    Button,
+    TriggerLeft,
+    TriggerRight,
+};
+
+struct MphPadBinding {
+    MphPadInputKind kind = MphPadInputKind::None;
+    SDL_GameControllerButton button = SDL_CONTROLLER_BUTTON_INVALID;
+};
+
+struct MphPadBindingSet {
+    std::array<MphPadBinding,
+               static_cast<size_t>(MphPrimeAction::Count)> bindings{};
+    bool valid = true;
+};
+
+MphPadBinding parse_mph_pad_binding(const std::string& value,
+                                    bool* recognized) {
+    if (recognized) *recognized = true;
+    const std::string normalized = binding_name_lower(value);
+    if (normalized.empty() || normalized == "none" ||
+        normalized == "unbound") {
+        return {};
+    }
+    auto button = [](SDL_GameControllerButton b) {
+        return MphPadBinding{MphPadInputKind::Button, b};
+    };
+    if (normalized == "pad a") return button(SDL_CONTROLLER_BUTTON_A);
+    if (normalized == "pad b") return button(SDL_CONTROLLER_BUTTON_B);
+    if (normalized == "pad x") return button(SDL_CONTROLLER_BUTTON_X);
+    if (normalized == "pad y") return button(SDL_CONTROLLER_BUTTON_Y);
+    if (normalized == "pad lb")
+        return button(SDL_CONTROLLER_BUTTON_LEFTSHOULDER);
+    if (normalized == "pad rb")
+        return button(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+    if (normalized == "pad l3")
+        return button(SDL_CONTROLLER_BUTTON_LEFTSTICK);
+    if (normalized == "pad r3")
+        return button(SDL_CONTROLLER_BUTTON_RIGHTSTICK);
+    if (normalized == "pad up") return button(SDL_CONTROLLER_BUTTON_DPAD_UP);
+    if (normalized == "pad down")
+        return button(SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+    if (normalized == "pad left")
+        return button(SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+    if (normalized == "pad right")
+        return button(SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+    if (normalized == "pad start")
+        return button(SDL_CONTROLLER_BUTTON_START);
+    if (normalized == "pad back" || normalized == "pad select")
+        return button(SDL_CONTROLLER_BUTTON_BACK);
+    if (normalized == "pad lt")
+        return {MphPadInputKind::TriggerLeft, SDL_CONTROLLER_BUTTON_INVALID};
+    if (normalized == "pad rt")
+        return {MphPadInputKind::TriggerRight, SDL_CONTROLLER_BUTTON_INVALID};
+    if (recognized) *recognized = false;
+    return {};
+}
+
+bool pad_binding_matches(const MphPadBinding& binding,
+                         MphPadInputKind kind,
+                         SDL_GameControllerButton button) {
+    if (binding.kind != kind) return false;
+    return kind != MphPadInputKind::Button || binding.button == button;
+}
+
+MphPadBindingSet make_mph_pad_bindings(
+    const NdsMphPrimeControlBindings& source) {
+    MphPadBindingSet set{};
+    auto put = [&](MphPrimeAction action, const std::string& value) {
+        bool recognized = true;
+        set.bindings[static_cast<size_t>(action)] =
+            parse_mph_pad_binding(value, &recognized);
+        if (!recognized) {
+            std::fprintf(stderr,
+                         "[sdl] invalid MPH Prime Controls pad binding: %s\n",
+                         value.c_str());
+            set.valid = false;
+        }
+    };
+    put(MphPrimeAction::MoveForward, source.move_forward);
+    put(MphPrimeAction::MoveBack, source.move_back);
+    put(MphPrimeAction::MoveLeft, source.move_left);
+    put(MphPrimeAction::MoveRight, source.move_right);
+    put(MphPrimeAction::Jump, source.jump);
+    put(MphPrimeAction::MorphBall, source.morph_ball);
+    put(MphPrimeAction::BoostZoom, source.boost_zoom);
+    put(MphPrimeAction::ScanVisor, source.scan_visor);
+    put(MphPrimeAction::UiLeft, source.ui_left);
+    put(MphPrimeAction::UiRight, source.ui_right);
+    put(MphPrimeAction::UiOk, source.ui_ok);
+    put(MphPrimeAction::Shoot, source.shoot);
+    put(MphPrimeAction::ScanShoot, source.scan_shoot);
+    put(MphPrimeAction::Beam, source.beam);
+    put(MphPrimeAction::Missile, source.missile);
+    put(MphPrimeAction::Weapon1, source.weapon1);
+    put(MphPrimeAction::Weapon2, source.weapon2);
+    put(MphPrimeAction::Weapon3, source.weapon3);
+    put(MphPrimeAction::Weapon4, source.weapon4);
+    put(MphPrimeAction::Weapon5, source.weapon5);
+    put(MphPrimeAction::Weapon6, source.weapon6);
+    put(MphPrimeAction::VirtualStylus, source.virtual_stylus);
+    put(MphPrimeAction::Menu, source.menu);
+    return set;
+}
+
+bool binding_matches_key(const MphPrimeBinding& binding, SDL_Scancode key) {
+    return binding.kind == MphPrimeInputKind::Key && binding.key == key;
+}
+
+bool binding_matches_mouse(const MphPrimeBinding& binding, uint8_t button) {
+    return binding.kind == MphPrimeInputKind::Mouse &&
+           binding.mouse == button;
+}
+
+uint16_t mph_prime_hold_mask(MphPrimeAction action) {
+    switch (action) {
+        case MphPrimeAction::MoveForward: return 1u << 6;  // Up
+        case MphPrimeAction::MoveBack:    return 1u << 7;  // Down
+        case MphPrimeAction::MoveLeft:    return 1u << 5;  // Left
+        case MphPrimeAction::MoveRight:   return 1u << 4;  // Right
+        case MphPrimeAction::Jump:        return 1u << 1;  // B
+        case MphPrimeAction::BoostZoom:   return 1u << 8;  // R
+        case MphPrimeAction::Shoot:
+        case MphPrimeAction::ScanShoot:   return 1u << 9;  // L
+        case MphPrimeAction::Menu:        return 1u << 3;  // Start
+        default:                          return 0;
+    }
+}
+
+void start_mph_touch_action(MphPrimeAction action,
+                            MphTouchSequence& sequence) {
+    const MphTouchStep up{0, 0, false, 2};
+    auto tap = [&](uint16_t x, uint16_t y, uint8_t touch_frames = 2,
+                   uint8_t release_frames = 2) {
+        sequence.start({up, {x, y, true, touch_frames},
+                        {0, 0, false, release_frames}});
+    };
+    switch (action) {
+        case MphPrimeAction::MorphBall:
+            // melonPrimeDS releases late here; boost ball is unreliable if
+            // the stylus is restored to aim-center immediately after morph.
+            tap(231, 167, 2, 8);
+            break;
+        case MphPrimeAction::ScanVisor:
+            // Hold the visor touch long enough for the transition path that
+            // melonPrimeDS handled with a 30-frame loop.
+            tap(128, 173, 30, 2);
+            break;
+        case MphPrimeAction::UiOk:
+            tap(128, 142);
+            break;
+        case MphPrimeAction::UiLeft:
+            tap(71, 141);
+            break;
+        case MphPrimeAction::UiRight:
+            tap(185, 141);
+            break;
+        case MphPrimeAction::Beam:
+            if (nds_title_patches_request_mph_weapon(0))
+                sequence.start({up, {128, 96, true, 2}});
+            break;
+        case MphPrimeAction::Missile:
+            if (nds_title_patches_request_mph_weapon(2))
+                sequence.start({up, {128, 96, true, 2}});
+            break;
+        case MphPrimeAction::Weapon1:
+            if (nds_title_patches_request_mph_weapon(7))
+                sequence.start({up, {128, 96, true, 2}});
+            break;
+        case MphPrimeAction::Weapon2:
+            if (nds_title_patches_request_mph_weapon(6))
+                sequence.start({up, {128, 96, true, 2}});
+            break;
+        case MphPrimeAction::Weapon3:
+            if (nds_title_patches_request_mph_weapon(5))
+                sequence.start({up, {128, 96, true, 2}});
+            break;
+        case MphPrimeAction::Weapon4:
+            if (nds_title_patches_request_mph_weapon(4))
+                sequence.start({up, {128, 96, true, 2}});
+            break;
+        case MphPrimeAction::Weapon5:
+            if (nds_title_patches_request_mph_weapon(3))
+                sequence.start({up, {128, 96, true, 2}});
+            break;
+        case MphPrimeAction::Weapon6:
+            if (nds_title_patches_request_mph_weapon(1))
+                sequence.start({up, {128, 96, true, 2}});
+            break;
+        default:
+            break;
+    }
+}
+
+MphPrimeBindingSet make_mph_prime_bindings(
+    const NdsMphPrimeControlBindings& source) {
+    MphPrimeBindingSet set{};
+    auto put = [&](MphPrimeAction action, const std::string& value) {
+        MphPrimeBinding binding = parse_mph_prime_binding(value);
+        if (binding.kind == MphPrimeInputKind::None &&
+            binding_name_lower(value) != "none" &&
+            binding_name_lower(value) != "unbound") {
+            std::fprintf(stderr,
+                         "[sdl] invalid MPH Prime Controls binding: %s\n",
+                         value.c_str());
+            set.valid = false;
+        }
+        set.bindings[static_cast<size_t>(action)] = binding;
+    };
+    put(MphPrimeAction::MoveForward, source.move_forward);
+    put(MphPrimeAction::MoveBack, source.move_back);
+    put(MphPrimeAction::MoveLeft, source.move_left);
+    put(MphPrimeAction::MoveRight, source.move_right);
+    put(MphPrimeAction::Jump, source.jump);
+    put(MphPrimeAction::MorphBall, source.morph_ball);
+    put(MphPrimeAction::BoostZoom, source.boost_zoom);
+    put(MphPrimeAction::ScanVisor, source.scan_visor);
+    put(MphPrimeAction::UiLeft, source.ui_left);
+    put(MphPrimeAction::UiRight, source.ui_right);
+    put(MphPrimeAction::UiOk, source.ui_ok);
+    put(MphPrimeAction::Shoot, source.shoot);
+    put(MphPrimeAction::ScanShoot, source.scan_shoot);
+    put(MphPrimeAction::Beam, source.beam);
+    put(MphPrimeAction::Missile, source.missile);
+    put(MphPrimeAction::Weapon1, source.weapon1);
+    put(MphPrimeAction::Weapon2, source.weapon2);
+    put(MphPrimeAction::Weapon3, source.weapon3);
+    put(MphPrimeAction::Weapon4, source.weapon4);
+    put(MphPrimeAction::Weapon5, source.weapon5);
+    put(MphPrimeAction::Weapon6, source.weapon6);
+    put(MphPrimeAction::VirtualStylus, source.virtual_stylus);
+    put(MphPrimeAction::Menu, source.menu);
+    return set;
+}
+constexpr int kWindowScale = 2;
+constexpr uint64_t kSystemCyclesPerFrame = 2130ull * 263ull;
+constexpr int kAudioFrequency = 33513982 / 1024;
+constexpr uint32_t kAudioQueueFrames = 2048;
+// Playback starts only once kAudioStartFrames (~1.5 s) are queued. The cold
+// boot's frames ~5-131 emulate below real time with a measured cumulative
+// production deficit of up to ~1.15 s; prebuffering more than that rides the
+// whole window out with zero gaps — the stream stays bit-exact, only the
+// initial latency is higher. The bounded drain (see drain_audio) then glides
+// the queue back down to the ~63 ms steady-state target over a couple of
+// seconds without ever freezing video, well before the Health & Safety
+// screen needs interactive input.
+constexpr uint32_t kAudioStartFrames = 57344;
+constexpr uint32_t kAudioFrameBytes = 2u * sizeof(int16_t);
+constexpr uint32_t kAudioCapacityFrames = 65536;
+
+struct AudioQueue {
+#if !defined(NDS_HAVE_SDL3)
+    std::array<int16_t, kAudioCapacityFrames * 2> samples{};
+    uint32_t read = 0;
+    uint32_t write = 0;
+    uint32_t count = 0;
+#endif
+    std::atomic<uint64_t> underruns{0};
+    std::atomic<bool> started{false};
+};
+
+#if defined(NDS_HAVE_SDL3)
+struct NdsAudioDevice {
+    SDL_AudioStream* stream = nullptr;
+    explicit operator bool() const { return stream != nullptr; }
+};
+
+// SDL3 has no mixer callback that can observe a short read the way the SDL2
+// ring-buffer callback below does, but the stream "get" callback carries the
+// same fact: additional_amount is how many more bytes the device needs beyond
+// what is already queued to satisfy this pull. A nonzero value while playback
+// is running is exactly the SDL2 path's `take < requested` condition — the
+// device ran dry. Without this the underrun counter would be permanently zero
+// under SDL3 and NDS_FRONTEND_REQUIRE_AUDIO would assert nothing.
+// Runs on the audio thread; `underruns` is atomic for that reason.
+void SDLCALL audio_stream_underrun_callback(void* userdata,
+                                            SDL_AudioStream* /*stream*/,
+                                            int additional_amount,
+                                            int /*total_amount*/) {
+    if (additional_amount <= 0) return;
+    auto* queue = static_cast<AudioQueue*>(userdata);
+    if (queue && queue->started.load(std::memory_order_relaxed))
+        queue->underruns.fetch_add(1, std::memory_order_relaxed);
+}
+#else
+using NdsAudioDevice = SDL_AudioDeviceID;
+
+void SDLCALL audio_callback(void* userdata, Uint8* stream, int len) {
+    // SDL owns this thread, so it cannot be registered at creation; it
+    // registers itself the first time it runs instead. One thread_local test
+    // per callback, and the whole point is that a mixing stall or an underrun
+    // storm becomes attributable to host symbols (host_profile.h).
+    static thread_local bool hostprof_registered = false;
+    if (!hostprof_registered) {
+        hostprof_registered = true;
+        nds_hostprof_register_current_thread(NDS_HOSTPROF_ROLE_AUDIO);
+    }
+    auto* queue = static_cast<AudioQueue*>(userdata);
+    std::memset(stream, 0, static_cast<size_t>(len));
+    if (!queue || len <= 0) return;
+    const uint32_t requested = static_cast<uint32_t>(len) / kAudioFrameBytes;
+    const uint32_t take = std::min(requested, queue->count);
+    auto* output = reinterpret_cast<int16_t*>(stream);
+    const uint32_t first = std::min(take, kAudioCapacityFrames - queue->read);
+    std::memcpy(output, queue->samples.data() + queue->read * 2u,
+                first * kAudioFrameBytes);
+    if (first < take)
+        std::memcpy(output + first * 2u, queue->samples.data(),
+                    (take - first) * kAudioFrameBytes);
+    queue->read = (queue->read + take) % kAudioCapacityFrames;
+    queue->count -= take;
+    if (take < requested && queue->started.load(std::memory_order_relaxed))
+        queue->underruns.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
+
+bool sdl_push_event(SDL_Event& event) {
+#if defined(NDS_HAVE_SDL3)
+    return SDL_PushEvent(&event);
+#else
+    return SDL_PushEvent(&event) == 1;
+#endif
+}
+
+bool sdl_init_frontend() {
+    // Keep the 1 ms host timer resolution used by the audio-queue throttle and
+    // the frame pacer. SDL2 got this from SDL_INIT_TIMER; SDL3 makes it a hint.
+    SDL_SetHintWithPriority(SDL_HINT_TIMER_RESOLUTION, "1",
+                            SDL_HINT_OVERRIDE);
+#if defined(NDS_HAVE_SDL3)
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+        std::fprintf(stderr, "[sdl] video/event init failed: %s\n",
+                     SDL_GetError());
+        return false;
+    }
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        // A lost audio route should not make the whole runner exit; the
+        // frontend opens a null stream and the game stays playable.
+        std::fprintf(stderr, "[sdl] audio init failed (continuing): %s\n",
+                     SDL_GetError());
+    }
+    if (!SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER)) {
+        std::fprintf(stderr,
+                     "[sdl] gamecontroller init failed (continuing): %s\n",
+                     SDL_GetError());
+    }
+    // Deterministic controller-presence test for the virtual-control
+    // auto-hide path. The Android wrapper sets this hint when a
+    // files/test-virtual-gamepad marker exists; desktop testers can set the
+    // environment variable of the same name.
+    const char* test_pad = std::getenv("NDS_TEST_VIRTUAL_GAMEPAD");
+    if (!test_pad || !*test_pad) {
+        test_pad = SDL_GetHint("NDS_TEST_VIRTUAL_GAMEPAD");
+    }
+    if (test_pad && *test_pad && test_pad[0] != '0') {
+        SDL_VirtualJoystickDesc desc;
+        SDL_INIT_INTERFACE(&desc);
+        desc.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        desc.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        desc.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        desc.name = "lostevo-test-pad";
+        const SDL_JoystickID id = SDL_AttachVirtualJoystick(&desc);
+        std::fprintf(stderr, "[sdl] test virtual gamepad: %s (id=%d)\n",
+                     id != 0 ? "attached" : SDL_GetError(),
+                     static_cast<int>(id));
+    }
+    return true;
+#else
+    return SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS |
+                    SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) == 0;
+#endif
+}
+
+bool sdl_set_thread_priority_high() {
+#if defined(NDS_HAVE_SDL3)
+    return SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+#else
+    return SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH) == 0;
+#endif
+}
+
+bool sdl_set_relative_mouse_mode(SDL_Window* window, bool enabled) {
+#if defined(NDS_HAVE_SDL3)
+    return SDL_SetWindowRelativeMouseMode(window, enabled);
+#else
+    (void)window;
+    return SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE) == 0;
+#endif
+}
+
+SDL_Scancode sdl_event_scancode(const SDL_Event& event) {
+#if defined(NDS_HAVE_SDL3)
+    return event.key.scancode;
+#else
+    return event.key.keysym.scancode;
+#endif
+}
+
+bool sdl_event_shift(const SDL_Event& event) {
+#if defined(NDS_HAVE_SDL3)
+    return (event.key.mod & SDL_KMOD_SHIFT) != 0;
+#else
+    return (event.key.keysym.mod & KMOD_SHIFT) != 0;
+#endif
+}
+
+unsigned savestate_function_key(SDL_Scancode scancode) {
+    if (scancode < SDL_SCANCODE_F1 || scancode > SDL_SCANCODE_F12)
+        return 0u;
+    return static_cast<unsigned>(scancode - SDL_SCANCODE_F1) + 1u;
+}
+
+void sdl_set_event_scancode(SDL_Event& event, SDL_Scancode key) {
+#if defined(NDS_HAVE_SDL3)
+    event.key.scancode = key;
+    event.key.key = SDL_GetKeyFromScancode(key, SDL_KMOD_NONE, true);
+    event.key.down = event.type == SDL_KEYDOWN;
+#else
+    event.key.keysym.scancode = key;
+    event.key.keysym.sym = SDL_GetKeyFromScancode(key);
+#endif
+}
+
+void sdl_set_mouse_button_state(SDL_Event& event, bool down) {
+#if defined(NDS_HAVE_SDL3)
+    event.button.down = down;
+#else
+    event.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+#endif
+}
+
+bool sdl_window_event_is(const SDL_Event& event, Uint32 window_event) {
+#if defined(NDS_HAVE_SDL3)
+    return event.type == window_event;
+#else
+    return event.type == SDL_WINDOWEVENT && event.window.event == window_event;
+#endif
+}
+
+void sdl_make_window_event(SDL_Event& event, Uint32 window_event,
+                           uint32_t window_id) {
+#if defined(NDS_HAVE_SDL3)
+    event.type = window_event;
+#else
+    event.type = SDL_WINDOWEVENT;
+    event.window.event = static_cast<Uint8>(window_event);
+#endif
+    event.window.windowID = window_id;
+}
+
+SDL_JoystickID sdl_controller_device_id(const SDL_Event& event) {
+#if defined(NDS_HAVE_SDL3)
+    return event.gdevice.which;
+#else
+    return event.cdevice.which;
+#endif
+}
+
+uint8_t sdl_controller_button(const SDL_Event& event) {
+#if defined(NDS_HAVE_SDL3)
+    return event.gbutton.button;
+#else
+    return event.cbutton.button;
+#endif
+}
+
+SDL_JoystickID sdl_controller_id(SDL_GameController* controller) {
+#if defined(NDS_HAVE_SDL3)
+    return SDL_GetGamepadID(controller);
+#else
+    return SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(controller));
+#endif
+}
+
+uint16_t key_bit(SDL_Scancode key) {
+    // KEYINPUT/EXTKEYIN are active-low. This layout follows the common DS
+    // emulator convention: Z/X = A/B, A/S = Y/X, Q/W = L/R.
+    switch (key) {
+        case SDL_SCANCODE_Z:         return 1u << 0;  // A
+        case SDL_SCANCODE_X:         return 1u << 1;  // B
+        case SDL_SCANCODE_BACKSPACE: return 1u << 2;  // Select
+        case SDL_SCANCODE_RETURN:    return 1u << 3;  // Start
+        case SDL_SCANCODE_RIGHT:     return 1u << 4;
+        case SDL_SCANCODE_LEFT:      return 1u << 5;
+        case SDL_SCANCODE_UP:        return 1u << 6;
+        case SDL_SCANCODE_DOWN:      return 1u << 7;
+        case SDL_SCANCODE_W:         return 1u << 8;  // R
+        case SDL_SCANCODE_Q:         return 1u << 9;  // L
+        case SDL_SCANCODE_S:         return 1u << 10; // X
+        case SDL_SCANCODE_A:         return 1u << 11; // Y
+        default:                     return 0;
+    }
+}
+
+uint16_t controller_bit(SDL_GameControllerButton button) {
+    switch (button) {
+        case SDL_CONTROLLER_BUTTON_A:             return 1u << 0;
+        case SDL_CONTROLLER_BUTTON_B:             return 1u << 1;
+        case SDL_CONTROLLER_BUTTON_BACK:          return 1u << 2;
+        case SDL_CONTROLLER_BUTTON_START:         return 1u << 3;
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:    return 1u << 4;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT:     return 1u << 5;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:       return 1u << 6;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:     return 1u << 7;
+        case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return 1u << 8;
+        case SDL_CONTROLLER_BUTTON_LEFTSHOULDER:  return 1u << 9;
+        case SDL_CONTROLLER_BUTTON_X:             return 1u << 10;
+        case SDL_CONTROLLER_BUTTON_Y:             return 1u << 11;
+        default:                                  return 0;
+    }
+}
+
+SDL_GameController* open_first_controller() {
+#if defined(NDS_HAVE_SDL3)
+    int count = 0;
+    SDL_JoystickID* gamepads = SDL_GetGamepads(&count);
+    if (!gamepads) return nullptr;
+    SDL_GameController* controller = nullptr;
+    for (int index = 0; index < count && !controller; ++index) {
+        if (!SDL_IsGamepad(gamepads[index])) continue;
+        controller = SDL_GameControllerOpen(gamepads[index]);
+    }
+    SDL_free(gamepads);
+    if (controller) {
+        std::fprintf(stderr, "[sdl] Player 1 controller: %s\n",
+                     SDL_GameControllerName(controller));
+    }
+    return controller;
+#else
+    for (int index = 0; index < SDL_NumJoysticks(); ++index) {
+        if (!SDL_IsGameController(index)) continue;
+        if (SDL_GameController* controller = SDL_GameControllerOpen(index)) {
+            std::fprintf(stderr, "[sdl] Player 1 controller: %s\n",
+                         SDL_GameControllerName(controller));
+            return controller;
+        }
+    }
+    return nullptr;
+#endif
+}
+
+void set_touch_from_mouse(float x, float y, bool down,
+                          const NdsLogicalRect& bottom_touch) {
+    // Coordinates are expected in the renderer's logical DS-space. The caller
+    // supplies the rectangle the touch screen occupies: the lower half in the
+    // stacked layout, the whole secondary window in the separate layout, and
+    // the lower-right inset in the single-screen layout.
+    if (!down || bottom_touch.width <= 0 || bottom_touch.height <= 0 ||
+        x < bottom_touch.x || x >= bottom_touch.x + bottom_touch.width ||
+        y < bottom_touch.y || y >= bottom_touch.y + bottom_touch.height) {
+        nds_set_touch(0, 0, false);
+        return;
+    }
+    const auto touch_x = static_cast<uint16_t>(std::clamp<int>(
+        static_cast<int>((x - bottom_touch.x) * kScreenWidth /
+                         bottom_touch.width),
+        0, kScreenWidth - 1));
+    const auto touch_y = static_cast<uint16_t>(std::clamp<int>(
+        static_cast<int>((y - bottom_touch.y) * kScreenHeight /
+                         bottom_touch.height),
+        0, kScreenHeight - 1));
+    nds_set_touch(touch_x, touch_y, true);
+}
+
+uint32_t audio_queue_count(const NdsAudioDevice& device, AudioQueue& queue) {
+    if (!device) return 0;
+#if defined(NDS_HAVE_SDL3)
+    (void)queue;
+    const int queued_bytes = SDL_GetAudioStreamQueued(device.stream);
+    return queued_bytes > 0
+        ? static_cast<uint32_t>(queued_bytes) / kAudioFrameBytes : 0;
+#else
+    SDL_LockAudioDevice(device);
+    const uint32_t count = queue.count;
+    SDL_UnlockAudioDevice(device);
+    return count;
+#endif
+}
+
+uint32_t drain_audio(const NdsAudioDevice& device, AudioQueue& queue,
+                     bool throttle, uint32_t pace_floor, bool& queue_error,
+                     uint32_t fade_total, uint32_t& fade_remaining) {
+    if (!device) return 0;
+    std::array<int16_t, 2048> samples{};
+    for (;;) {
+        const uint32_t frames = nds_spu_read_output(samples.data(), 1024);
+        if (!frames) break;
+        if (fade_total != 0 && fade_remaining != 0) {
+            const uint32_t count = std::min(frames, fade_remaining);
+            const uint32_t done = fade_total - fade_remaining;
+            for (uint32_t i = 0; i < count; ++i) {
+                const int32_t gain =
+                    static_cast<int32_t>(((done + i) * 65536u) / fade_total);
+                samples[i * 2] = static_cast<int16_t>(
+                    (static_cast<int32_t>(samples[i * 2]) * gain) >> 16);
+                samples[i * 2 + 1] = static_cast<int16_t>(
+                    (static_cast<int32_t>(samples[i * 2 + 1]) * gain) >> 16);
+            }
+            fade_remaining -= count;
+        }
+        bool pushed = false;
+        while (!pushed) {
+#if defined(NDS_HAVE_SDL3)
+            const uint32_t queued = audio_queue_count(device, queue);
+            if (kAudioCapacityFrames - queued >= frames) {
+                if (SDL_PutAudioStreamData(device.stream, samples.data(),
+                                           static_cast<int>(
+                                               frames * kAudioFrameBytes))) {
+                    pushed = true;
+                } else {
+                    queue_error = true;
+                    return audio_queue_count(device, queue);
+                }
+            }
+#else
+            SDL_LockAudioDevice(device);
+            if (kAudioCapacityFrames - queue.count >= frames) {
+                const uint32_t first = std::min(
+                    frames, kAudioCapacityFrames - queue.write);
+                std::memcpy(queue.samples.data() + queue.write * 2u,
+                            samples.data(), first * kAudioFrameBytes);
+                if (first < frames)
+                    std::memcpy(queue.samples.data(),
+                                samples.data() + first * 2u,
+                                (frames - first) * kAudioFrameBytes);
+                queue.write = (queue.write + frames) % kAudioCapacityFrames;
+                queue.count += frames;
+                pushed = true;
+            }
+            SDL_UnlockAudioDevice(device);
+#endif
+            if (!pushed) {
+                if (!throttle) {
+                    queue_error = true;
+                    return audio_queue_count(device, queue);
+                }
+                SDL_Delay(1);
+            }
+        }
+    }
+    // Audio is the host's real-time clock. Never drop a produced block: if the
+    // emulator is faster than the DS cadence, let SDL consume the backlog
+    // before emulating another frame. pace_floor is the current allowance:
+    // kAudioQueueFrames in steady state, temporarily higher right after the
+    // boot prebuffer (the caller decays it a fixed step per frame). The sleep
+    // only stops the queue RISING above the floor — it never forces the queue
+    // down while the emulator is running behind, so a slow stretch spends the
+    // buffered runway instead of having it slept away.
+    uint32_t queued = audio_queue_count(device, queue);
+    while (throttle && queued > pace_floor) {
+        SDL_Delay(1);
+        queued = audio_queue_count(device, queue);
+    }
+    return queued;
+}
+
+void clear_audio_queue(const NdsAudioDevice& device, AudioQueue& queue) {
+    if (!device) return;
+#if defined(NDS_HAVE_SDL3)
+    SDL_ClearAudioStream(device.stream);
+    (void)queue;
+#else
+    SDL_LockAudioDevice(device);
+    queue.read = 0;
+    queue.write = 0;
+    queue.count = 0;
+    SDL_UnlockAudioDevice(device);
+#endif
+}
+
+void pause_audio(const NdsAudioDevice& device, bool paused) {
+    if (!device) return;
+#if defined(NDS_HAVE_SDL3)
+    if (paused) SDL_PauseAudioStreamDevice(device.stream);
+    else SDL_ResumeAudioStreamDevice(device.stream);
+#else
+    SDL_PauseAudioDevice(device, paused ? 1 : 0);
+#endif
+}
+
+void close_audio(NdsAudioDevice& device) {
+    if (!device) return;
+#if defined(NDS_HAVE_SDL3)
+    SDL_DestroyAudioStream(device.stream);
+    device.stream = nullptr;
+#else
+    SDL_CloseAudioDevice(device);
+    device = 0;
+#endif
+}
+
+NdsAudioDevice open_audio_device(AudioQueue& queue,
+                                 const SDL_AudioSpec& want) {
+#if defined(NDS_HAVE_SDL3)
+    NdsAudioDevice device{};
+    device.stream = SDL_OpenAudioDeviceStream(
+        SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &want, nullptr, nullptr);
+    if (device.stream) {
+        SDL_AudioSpec source{};
+        SDL_AudioSpec destination{};
+        if (SDL_GetAudioStreamFormat(device.stream, &source, &destination)) {
+            std::fprintf(stderr,
+                "[sdl] audio stream: source %d Hz/%u ch -> device %d Hz/%u ch\n",
+                source.freq, source.channels, destination.freq,
+                destination.channels);
+        }
+    }
+    if (device.stream &&
+        !SDL_SetAudioStreamGetCallback(
+            device.stream, audio_stream_underrun_callback, &queue)) {
+        // Refuse a device that cannot report underruns rather than silently
+        // shipping a frontend whose audio gate asserts nothing.
+        std::fprintf(stderr,
+            "[sdl] audio underrun callback unavailable: %s\n", SDL_GetError());
+        close_audio(device);
+    }
+    return device;
+#else
+    SDL_AudioSpec got{};
+    NdsAudioDevice device = SDL_OpenAudioDevice(nullptr, 0, &want, &got, 0);
+    if (device && (got.freq != want.freq || got.format != want.format ||
+                   got.channels != want.channels)) {
+        std::fprintf(stderr,
+            "[sdl] refusing mismatched audio format: want=%d/%u/%u "
+            "got=%d/%u/%u\n",
+            want.freq, want.format, want.channels,
+            got.freq, got.format, got.channels);
+        close_audio(device);
+    }
+    return device;
+#endif
+}
+
+void discard_spu_output() {
+    std::array<int16_t, 2048> samples{};
+    while (nds_spu_read_output(samples.data(), 1024) != 0) {}
+}
+
+uint64_t environment_u64(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value || !*value) return 0;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    return end == value ? 0 : static_cast<uint64_t>(parsed);
+}
+
+uint64_t framebuffer_rgb_fnv(int screen) {
+    const uint32_t* framebuffer = nds_gpu2d_framebuffer(screen);
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0; i < 256u * 192u; ++i) {
+        const uint32_t pixel = framebuffer[i];
+        const uint8_t rgb[3] = {
+            static_cast<uint8_t>(pixel >> 16),
+            static_cast<uint8_t>(pixel >> 8),
+            static_cast<uint8_t>(pixel),
+        };
+        for (const uint8_t byte : rgb) {
+            hash ^= byte;
+            hash *= 1099511628211ull;
+        }
+    }
+    return hash;
+}
+
+constexpr const char* kRuntimeMouseSensitivityKey =
+    "input.mouse_sensitivity";
+// Fast forward is a HELD key, never a toggle: every front end that shipped a
+// toggle taught players to leave it on and then wonder why their timing was
+// wrong. Left shift is free (the savestate modifiers ride on the F keys), and
+// it is the binding the sibling ports and most emulators already use.
+constexpr const char* kRuntimeFastForwardKey = "input.fast_forward";
+constexpr int kRuntimeFastForwardMax = 4;
+
+// Colour reproduction and the LCD pixel grid are the two picture effects the
+// presenter owns outright: both are pure functions of the composed framebuffer,
+// so they can be applied without touching guest state, without a rebuilt
+// presentation and without a shader. They get their own keys rather than the
+// shared standard menu's "graphics.color_correction" / "graphics.lcd_ghosting"
+// bits, because those name different effects (a fixed correction, and a
+// persistence trail) and a row whose label lies about what it does is worse
+// than one that is absent.
+constexpr const char* kRuntimeColorModeKey = "graphics.color_mode";
+constexpr const char* kRuntimeLcdGridKey = "graphics.lcd_grid";
+
+// The interactive frontend keeps running while the menu is open, so every
+// setting here has to be something the host can change on a live presentation:
+// window state, scaling/filtering, the audio device, and save-state slots. Rows
+// whose effect would need a rebuilt presentation (screen layout, view mode,
+// adaptive widescreen) are deliberately not offered yet -- a settings row that
+// does nothing when you press it is worse than one that is absent.
+struct RecompRuntimeSettings {
+    int fullscreen = 0;      // 0 windowed, 1 borderless, 2 exclusive
+    int window_scale = 2;
+    int integer_scale = 0;
+    int texture_filter = 0;  // 0 nearest, 1 linear
+    int resolution_scale = 1;
+    int audio_enabled = 1;
+    int volume = 100;
+    int pause_in_menu = 1;
+    int menu_dim = RECOMP_RUNTIME_UI_DEFAULT_DIM_PERCENT;
+    int menu_opacity = 100;
+    int state_slot = 1;
+    int mouse_sensitivity = 100;
+    int fast_forward = 2;    // held-key multiplier, 0 = disabled
+    int color_mode = 0;      // 0 original, 1 light, 2 moderate, 3 strong
+    int lcd_grid = 0;        // dim one pixel in two
+};
+
+constexpr int kRuntimeWindowScaleMax = 8;
+constexpr int kRuntimeResolutionScaleMax = 4;
+
+// Which presentation keys the settings file actually carried.
+//
+// Reading a file is not restoring it: every row's effect lives in a hook that
+// is attached further down, below the presentation it changes, so a player who
+// sets window scale 3, quits and relaunches would otherwise get 2 again. But
+// restoring by value instead of by presence is its own bug -- a file with no
+// `display.fullscreen` key would then push the built-in default over whatever
+// the command line asked for. So startup restore is driven by presence.
+struct RecompRuntimeRestore {
+    bool fullscreen = false;
+    bool window = false;       // window_scale or integer_scale
+    bool filter = false;
+    bool resolution = false;
+    bool audio = false;        // audio.enabled or audio.volume
+    bool mouse = false;
+    bool color = false;        // color_mode and/or lcd_grid
+};
+
+// The settings file is the same flat key=value text the framework's launcher
+// reads; one writer, one reader, no schema hidden in the binary.
+std::vector<std::pair<std::string, std::string>> read_settings_lines(
+        const std::string& path) {
+    std::vector<std::pair<std::string, std::string>> entries;
+    if (path.empty()) return entries;
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t equals = line.find('=');
+        if (equals == std::string::npos) continue;
+        std::string key = line.substr(0, equals);
+        std::string value = line.substr(equals + 1);
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\r'))
+            key.pop_back();
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\r'))
+            value.pop_back();
+        entries.emplace_back(std::move(key), std::move(value));
+    }
+    return entries;
+}
+
+int settings_int(
+        const std::vector<std::pair<std::string, std::string>>& entries,
+        const char* key, int fallback, int minimum, int maximum) {
+    for (const auto& entry : entries) {
+        if (entry.first != key) continue;
+        char* end = nullptr;
+        const long parsed = std::strtol(entry.second.c_str(), &end, 10);
+        if (end == entry.second.c_str()) return fallback;
+        return static_cast<int>(
+            std::clamp<long>(parsed, minimum, maximum));
+    }
+    return fallback;
+}
+
+bool settings_has(
+        const std::vector<std::pair<std::string, std::string>>& entries,
+        const char* key) {
+    for (const auto& entry : entries) {
+        if (entry.first == key) return true;
+    }
+    return false;
+}
+
+void load_runtime_settings(const std::string& path,
+                           RecompRuntimeSettings& settings,
+                           RecompRuntimeRestore* restore = nullptr) {
+    const auto entries = read_settings_lines(path);
+    if (restore) {
+        restore->fullscreen = settings_has(entries, "display.fullscreen");
+        restore->window = settings_has(entries, "display.window_scale") ||
+                          settings_has(entries, "graphics.integer_scale");
+        restore->filter = settings_has(entries, "graphics.texture_filter");
+        restore->resolution = settings_has(entries, "graphics.resolution_scale");
+        restore->audio = settings_has(entries, "audio.enabled") ||
+                         settings_has(entries, "audio.volume");
+        restore->mouse = settings_has(entries, "input.mouse_sensitivity");
+        restore->color = settings_has(entries, kRuntimeColorModeKey) ||
+                         settings_has(entries, kRuntimeLcdGridKey);
+    }
+    if (entries.empty()) return;
+    settings.fullscreen = settings_int(
+        entries, "display.fullscreen", settings.fullscreen, 0, 2);
+    settings.window_scale = settings_int(
+        entries, "display.window_scale", settings.window_scale, 1,
+        kRuntimeWindowScaleMax);
+    settings.integer_scale = settings_int(
+        entries, "graphics.integer_scale", settings.integer_scale, 0, 1);
+    settings.texture_filter = settings_int(
+        entries, "graphics.texture_filter", settings.texture_filter, 0, 1);
+    settings.resolution_scale = settings_int(
+        entries, "graphics.resolution_scale", settings.resolution_scale, 1,
+        kRuntimeResolutionScaleMax);
+    settings.audio_enabled = settings_int(
+        entries, "audio.enabled", settings.audio_enabled, 0, 1);
+    settings.volume = settings_int(
+        entries, "audio.volume", settings.volume, 0, 100);
+    settings.pause_in_menu = settings_int(
+        entries, "system.pause_in_menu", settings.pause_in_menu, 0, 1);
+    settings.menu_dim = settings_int(
+        entries, "display.menu_dim", settings.menu_dim, 0, 100);
+    settings.menu_opacity = settings_int(
+        entries, "display.menu_opacity", settings.menu_opacity, 0, 100);
+    settings.state_slot = settings_int(
+        entries, "system.state_slot", settings.state_slot, 1,
+        static_cast<int>(NDS_SAVESTATE_SLOT_COUNT));
+    settings.mouse_sensitivity = settings_int(
+        entries, "input.mouse_sensitivity", settings.mouse_sensitivity, 10,
+        400);
+    settings.fast_forward = settings_int(
+        entries, "input.fast_forward", settings.fast_forward, 0,
+        kRuntimeFastForwardMax);
+    settings.color_mode = settings_int(
+        entries, kRuntimeColorModeKey, settings.color_mode, 0,
+        nds_display_filter::kColorModeCount - 1);
+    settings.lcd_grid = settings_int(
+        entries, kRuntimeLcdGridKey, settings.lcd_grid, 0, 1);
+}
+
+bool save_runtime_settings(const std::string& path,
+                           const RecompRuntimeSettings& settings) {
+    if (path.empty()) return false;
+    std::filesystem::path target(path);
+    std::error_code error;
+    if (!target.parent_path().empty()) {
+        std::filesystem::create_directories(target.parent_path(), error);
+        if (error) return false;
+    }
+    std::vector<std::string> lines;
+    lines.emplace_back("settings_version=14");
+    lines.emplace_back("display.fullscreen=" +
+                       std::to_string(settings.fullscreen));
+    lines.emplace_back("display.window_scale=" +
+                       std::to_string(settings.window_scale));
+    lines.emplace_back("display.menu_dim=" +
+                       std::to_string(settings.menu_dim));
+    lines.emplace_back("display.menu_opacity=" +
+                       std::to_string(settings.menu_opacity));
+    lines.emplace_back("graphics.integer_scale=" +
+                       std::to_string(settings.integer_scale));
+    lines.emplace_back("graphics.texture_filter=" +
+                       std::to_string(settings.texture_filter));
+    lines.emplace_back("graphics.resolution_scale=" +
+                       std::to_string(settings.resolution_scale));
+    lines.emplace_back("audio.enabled=" +
+                       std::to_string(settings.audio_enabled));
+    lines.emplace_back("audio.volume=" + std::to_string(settings.volume));
+    lines.emplace_back("system.pause_in_menu=" +
+                       std::to_string(settings.pause_in_menu));
+    lines.emplace_back("system.state_slot=" +
+                       std::to_string(settings.state_slot));
+    lines.emplace_back("input.mouse_sensitivity=" +
+                       std::to_string(settings.mouse_sensitivity));
+    lines.emplace_back("input.fast_forward=" +
+                       std::to_string(settings.fast_forward));
+    lines.emplace_back(std::string(kRuntimeColorModeKey) + "=" +
+                       std::to_string(settings.color_mode));
+    lines.emplace_back(std::string(kRuntimeLcdGridKey) + "=" +
+                       std::to_string(settings.lcd_grid));
+    std::ofstream out(target, std::ios::trunc);
+    if (!out) return false;
+    for (const std::string& line : lines) out << line << '\n';
+    return static_cast<bool>(out);
+}
+
+// Everything the settings menu needs to reach lives in the frontend loop, so
+// the callbacks below stay free functions and the loop hands them the effects
+// it owns (SDL windows, the audio stream, the guest save state). A row that has
+// no hook leaves its field set but changes nothing live, which is why only rows
+// with a real effect are requested from the standard builder.
+struct RuntimeMenuState {
+    NdsFrontendOptions* options = nullptr;
+    bool* running = nullptr;
+    bool close_requested = false;
+    RecompRuntimeSettings settings{};
+    std::function<void(int)> apply_fullscreen;         // 0/1/2
+    std::function<void(int, int)> apply_window;        // scale, integer
+    std::function<void(int)> apply_filter;             // 0 nearest, 1 linear
+    std::function<void(int)> apply_resolution;         // internal scale
+    std::function<void(int, int)> apply_audio;         // enabled, volume
+    std::function<void(int, int)> apply_backdrop;      // dim, opacity
+    std::function<void(int)> apply_pause;              // pause_in_menu
+    std::function<void(int)> apply_fast_forward;       // multiplier, 0 = off
+    std::function<void(int)> save_state;               // slot
+    std::function<void(int)> load_state;               // slot
+    std::function<void()> persist;
+};
+
+int runtime_menu_get_value(void* context, const RecompRuntimeUiItem* item,
+                           int* value_out) {
+    auto* state = static_cast<RuntimeMenuState*>(context);
+    if (!state || !state->options || !item || !value_out) return 0;
+    const RecompRuntimeSettings& s = state->settings;
+    const char* key = item->key;
+    if (std::strcmp(key, kRuntimeMouseSensitivityKey) == 0) {
+        *value_out = state->options->relative_mouse_sensitivity;
+        return 1;
+    }
+    if (std::strcmp(key, kRuntimeFastForwardKey) == 0) {
+        *value_out = s.fast_forward;
+        return 1;
+    }
+    if (std::strcmp(key, kRuntimeColorModeKey) == 0) {
+        *value_out = s.color_mode;
+        return 1;
+    }
+    if (std::strcmp(key, kRuntimeLcdGridKey) == 0) {
+        *value_out = s.lcd_grid;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_FULLSCREEN) == 0) {
+        *value_out = s.fullscreen;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE) == 0) {
+        *value_out = s.window_scale;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE) == 0) {
+        *value_out = s.integer_scale;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0) {
+        *value_out = s.texture_filter;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_RESOLUTION_SCALE) == 0) {
+        *value_out = s.resolution_scale;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_AUDIO) == 0) {
+        *value_out = s.audio_enabled;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) {
+        *value_out = s.volume;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_MENU_DIM) == 0) {
+        *value_out = s.menu_dim;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_MENU_OPACITY) == 0) {
+        *value_out = s.menu_opacity;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_PAUSE_IN_MENU) == 0) {
+        *value_out = s.pause_in_menu;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_STATE_SLOT) == 0) {
+        *value_out = s.state_slot;
+        return 1;
+    }
+    return 0;
+}
+
+int runtime_menu_set_value(void* context, const RecompRuntimeUiItem* item,
+                           int value) {
+    auto* state = static_cast<RuntimeMenuState*>(context);
+    if (!state || !state->options || !item) return 0;
+    RecompRuntimeSettings& s = state->settings;
+    const char* key = item->key;
+    if (std::strcmp(key, kRuntimeMouseSensitivityKey) == 0) {
+        if (value < 10 || value > 400) return 0;
+        state->options->relative_mouse_sensitivity =
+            static_cast<uint16_t>(value);
+        std::fprintf(stderr, "[sdl] mouse sensitivity set to %d%%\n", value);
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_FULLSCREEN) == 0) {
+        if (value < 0 || value > 2) return 0;
+        s.fullscreen = value;
+        if (state->apply_fullscreen) state->apply_fullscreen(value);
+        std::fprintf(stderr, "[sdl] fullscreen -> %d\n", value);
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_WINDOW_SCALE) == 0) {
+        if (value < 1 || value > kRuntimeWindowScaleMax) return 0;
+        s.window_scale = value;
+        if (state->apply_window) state->apply_window(value, s.integer_scale);
+        std::fprintf(stderr, "[sdl] window scale -> %dx\n", value);
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE) == 0) {
+        s.integer_scale = value ? 1 : 0;
+        if (state->apply_window)
+            state->apply_window(s.window_scale, s.integer_scale);
+        std::fprintf(stderr, "[sdl] integer scaling -> %s\n",
+                     s.integer_scale ? "on" : "off");
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0) {
+        s.texture_filter = value ? 1 : 0;
+        if (state->apply_filter) state->apply_filter(s.texture_filter);
+        std::fprintf(stderr, "[sdl] image filter -> %s\n",
+                     s.texture_filter ? "linear" : "nearest");
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_RESOLUTION_SCALE) == 0) {
+        if (value < 1 || value > kRuntimeResolutionScaleMax) return 0;
+        s.resolution_scale = value;
+        if (state->apply_resolution) state->apply_resolution(value);
+        std::fprintf(stderr, "[sdl] resolution scale -> %dx\n", value);
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_AUDIO) == 0) {
+        s.audio_enabled = value ? 1 : 0;
+        if (state->apply_audio) state->apply_audio(s.audio_enabled, s.volume);
+        std::fprintf(stderr, "[sdl] audio -> %s\n",
+                     s.audio_enabled ? "on" : "off");
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) {
+        if (value < 0 || value > 100) return 0;
+        s.volume = value;
+        if (state->apply_audio) state->apply_audio(s.audio_enabled, s.volume);
+        std::fprintf(stderr, "[sdl] volume -> %d%%\n", value);
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_MENU_DIM) == 0) {
+        if (value < 0 || value > 100) return 0;
+        s.menu_dim = value;
+        if (state->apply_backdrop)
+            state->apply_backdrop(s.menu_dim, s.menu_opacity);
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_MENU_OPACITY) == 0) {
+        if (value < 0 || value > 100) return 0;
+        s.menu_opacity = value;
+        if (state->apply_backdrop)
+            state->apply_backdrop(s.menu_dim, s.menu_opacity);
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_PAUSE_IN_MENU) == 0) {
+        s.pause_in_menu = value ? 1 : 0;
+        if (state->apply_pause) state->apply_pause(s.pause_in_menu);
+        std::fprintf(stderr, "[sdl] pause in menu -> %s\n",
+                     s.pause_in_menu ? "on" : "off");
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_STATE_SLOT) == 0) {
+        if (value < 1 ||
+            value > static_cast<int>(NDS_SAVESTATE_SLOT_COUNT)) return 0;
+        s.state_slot = value;
+        std::fprintf(stderr, "[sdl] savestate slot -> %d\n", value);
+        return 1;
+    }
+    if (std::strcmp(key, kRuntimeFastForwardKey) == 0) {
+        if (value < 0 || value > kRuntimeFastForwardMax) return 0;
+        s.fast_forward = value;
+        if (state->apply_fast_forward) state->apply_fast_forward(value);
+        std::fprintf(stderr, "[sdl] fast forward -> %dx\n", value);
+        return 1;
+    }
+    if (std::strcmp(key, kRuntimeColorModeKey) == 0) {
+        if (!nds_display_filter::color_mode_is_valid(value)) return 0;
+        s.color_mode = value;
+        // No hook and no engine call: the presenter applies the curve to the
+        // picture it is about to upload, and it reads these two values every
+        // frame, so the very next presented frame already carries the change.
+        std::fprintf(stderr, "[sdl] color mode -> %s\n",
+                     nds_display_filter::color_mode_name(value));
+        return 1;
+    }
+    if (std::strcmp(key, kRuntimeLcdGridKey) == 0) {
+        s.lcd_grid = value ? 1 : 0;
+        std::fprintf(stderr, "[sdl] lcd grid -> %s\n",
+                     s.lcd_grid ? "on" : "off");
+        return 1;
+    }
+    return 0;
+}
+
+int runtime_menu_run_action(void* context, const RecompRuntimeUiItem* item) {
+    auto* state = static_cast<RuntimeMenuState*>(context);
+    if (!state || !item) return 0;
+    const char* key = item->key;
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_RESUME) == 0) {
+        state->close_requested = true;
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_SAVE_STATE) == 0) {
+        if (state->save_state) state->save_state(state->settings.state_slot);
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_LOAD_STATE) == 0) {
+        if (state->load_state) state->load_state(state->settings.state_slot);
+        return 1;
+    }
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_QUIT) == 0) {
+        if (state->running) *state->running = false;
+        return 1;
+    }
+    return 0;
+}
+
+int runtime_menu_is_enabled(void* context, const RecompRuntimeUiItem* item) {
+    auto* state = static_cast<RuntimeMenuState*>(context);
+    if (!state || !state->options || !item) return 0;
+    const char* key = item->key;
+    if (std::strcmp(key, kRuntimeMouseSensitivityKey) == 0)
+        return state->options->relative_mouse_touch ? 1 : 0;
+    if (std::strcmp(key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0)
+        return state->settings.audio_enabled ? 1 : 0;
+    return 1;
+}
+
+void runtime_menu_save(void* context) {
+    auto* state = static_cast<RuntimeMenuState*>(context);
+    if (!state || !state->options) return;
+    if (state->persist) state->persist();
+}
+
+
+bool runtime_menu_key_input(SDL_Scancode scancode,
+                            RecompRuntimeUiInput* input) {
+    if (!input) return false;
+    switch (scancode) {
+        case SDL_SCANCODE_ESCAPE:
+            *input = RECOMP_RUNTIME_UI_INPUT_TOGGLE;
+            return true;
+        case SDL_SCANCODE_BACKSPACE:
+            *input = RECOMP_RUNTIME_UI_INPUT_BACK;
+            return true;
+        case SDL_SCANCODE_UP:
+            *input = RECOMP_RUNTIME_UI_INPUT_UP;
+            return true;
+        case SDL_SCANCODE_DOWN:
+            *input = RECOMP_RUNTIME_UI_INPUT_DOWN;
+            return true;
+        case SDL_SCANCODE_LEFT:
+            *input = RECOMP_RUNTIME_UI_INPUT_LEFT;
+            return true;
+        case SDL_SCANCODE_RIGHT:
+            *input = RECOMP_RUNTIME_UI_INPUT_RIGHT;
+            return true;
+        case SDL_SCANCODE_RETURN:
+        case SDL_SCANCODE_KP_ENTER:
+            *input = RECOMP_RUNTIME_UI_INPUT_ACCEPT;
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool runtime_menu_controller_input(SDL_GameControllerButton button,
+                                   RecompRuntimeUiInput* input) {
+    if (!input) return false;
+    switch (button) {
+        case SDL_CONTROLLER_BUTTON_START:
+            *input = RECOMP_RUNTIME_UI_INPUT_TOGGLE;
+            return true;
+        case SDL_CONTROLLER_BUTTON_BACK:
+        case SDL_CONTROLLER_BUTTON_B:
+            *input = RECOMP_RUNTIME_UI_INPUT_BACK;
+            return true;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:
+            *input = RECOMP_RUNTIME_UI_INPUT_UP;
+            return true;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
+            *input = RECOMP_RUNTIME_UI_INPUT_DOWN;
+            return true;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
+            *input = RECOMP_RUNTIME_UI_INPUT_LEFT;
+            return true;
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
+            *input = RECOMP_RUNTIME_UI_INPUT_RIGHT;
+            return true;
+        case SDL_CONTROLLER_BUTTON_A:
+            *input = RECOMP_RUNTIME_UI_INPUT_ACCEPT;
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Host-side display post-processing: the DS colour-reproduction curve and the
+// LCD pixel grid. Both are pure functions of the composed framebuffer, so this
+// is the whole of their integration -- no SDL object, no guest state.
+//
+// Applied to the composed guest picture and BEFORE the menu overlay, because
+// the menu is a host surface and tinting its text would be a different feature.
+//
+// Returns the input pointer untouched when neither effect is active, so the
+// default picture is the exact guest framebuffer: nothing downstream (frame
+// digests, the black-band scan, the coverage path) ever sees a copy that
+// happens to be identical.
+const uint32_t* filtered_screen(const uint32_t* pixels,
+                                int screen,
+                                int width,
+                                int height,
+                                int color_mode,
+                                bool lcd_grid) {
+    if (!pixels || width <= 0 || height <= 0) return pixels;
+    uint8_t lut[256];
+    nds_display_filter::build_lut(color_mode, lut);
+    if (!lcd_grid && nds_display_filter::lut_is_identity(lut)) return pixels;
+    // One scratch surface per screen, reused across frames: this runs on every
+    // presented frame, so a per-frame allocation here would be a per-frame
+    // allocator round trip at 60 Hz.
+    static std::vector<uint32_t> surfaces[2];
+    std::vector<uint32_t>& surface = surfaces[screen == 1 ? 1 : 0];
+    surface.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+    if (!nds_display_filter::apply(pixels, surface.data(), width, height, width,
+                                   color_mode, lcd_grid)) {
+        return pixels;
+    }
+    return surface.data();
+}
+
+const uint32_t* runtime_menu_overlay(RecompRuntimeUi* ui,
+                                     const uint32_t* pixels,
+                                     int width,
+                                     int height) {
+    if (!ui || !recomp_runtime_ui_is_open(ui) || !pixels ||
+        width <= 0 || height <= 0) {
+        return pixels;
+    }
+    static std::vector<uint32_t> surface;
+    const size_t count = static_cast<size_t>(width) *
+                         static_cast<size_t>(height);
+    surface.assign(pixels, pixels + count);
+    recomp_runtime_ui_render_argb8888(
+        ui, surface.data(), width, height, width * sizeof(uint32_t));
+    return surface.data();
+}
+
+struct FrontendPresentation {
+    bool separate = false;
+    bool single = false;
+    bool gl_top = false;
+    SDL_Window* windows[2]{};
+    SDL_Renderer* renderers[2]{};
+    SDL_Texture* textures[2]{};
+    SDL_Texture* sample_targets[2]{};
+    uint32_t window_ids[2]{};
+    int screen_widths[2]{kScreenWidth, kScreenWidth};
+    int canvas_width = kScreenWidth;
+    int canvas_height = kScreenHeight * 2;
+    bool single_portrait = false;
+    // Resolved single-screen composition in logical canvas coordinates.
+    // Fold mode replaces the fixed portrait/side-panel rectangles with a
+    // hinge-aware top/bottom (or left/right) split.
+    bool fold_split = false;
+    bool fold_horizontal = false;
+    bool fold_valid = false;
+    float fold_left = 0.0f;
+    float fold_top = 0.0f;
+    float fold_right = 0.0f;
+    float fold_bottom = 0.0f;
+    SDL_Rect layout_top{};
+    SDL_Rect layout_bottom{};
+    SDL_Rect layout_controls{};
+    int configured_sample_scale = 1;
+    int sample_scale = 1;
+};
+
+// docs/frame_interpolation.md, MVP blend mode. Holds the previous DS frame's
+// post-compositor ARGB pixels per screen plus the scratch the blend is built
+// into. These are copies taken after composition, so nothing the guest can
+// observe is involved and no scheduler work is attached to them.
+struct FrameBlendCache {
+    std::vector<uint32_t> previous[2];
+    std::vector<uint32_t> blended[2];
+    int widths[2]{0, 0};
+    bool valid = false;
+};
+
+// 50/50 per-channel average, the alpha 0.5 midpoint the 120 Hz target wants.
+// The low bit of each channel is dropped rather than rounded (invisible at 8
+// bits, one pass of cheap word arithmetic over ~100k pixels), and the alpha
+// byte is carried straight from the current frame so a blended upload is
+// byte-compatible with the real uploads either side of it.
+void blend_half(const uint32_t* previous, const uint32_t* current,
+                uint32_t* out, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        out[i] = (current[i] & 0xFF000000u) |
+                 (((previous[i] >> 1) & 0x007F7F7Fu) +
+                  ((current[i] >> 1) & 0x007F7F7Fu));
+    }
+}
+
+void cache_presented_frame(FrameBlendCache& cache, int screen,
+                           const uint32_t* pixels, int width) {
+    const size_t count = static_cast<size_t>(width) * kScreenHeight;
+    if (cache.widths[screen] != width) {
+        cache.widths[screen] = width;
+        cache.previous[screen].assign(count, 0u);
+        cache.blended[screen].assign(count, 0u);
+    }
+    std::memcpy(cache.previous[screen].data(), pixels,
+                count * sizeof(uint32_t));
+}
+
+#if !defined(NDS_HAVE_SDL3)
+uint32_t fullscreen_flags(NdsFullscreenMode mode) {
+    switch (mode) {
+        case NdsFullscreenMode::Borderless:
+            return SDL_WINDOW_FULLSCREEN_DESKTOP;
+        case NdsFullscreenMode::Exclusive:
+            return static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
+        default:
+            return 0;
+    }
+}
+#endif
+
+void destroy_presentation(FrontendPresentation& presentation) {
+    for (SDL_Texture*& texture : presentation.sample_targets) {
+        if (texture) SDL_DestroyTexture(texture);
+        texture = nullptr;
+    }
+    for (SDL_Texture*& texture : presentation.textures) {
+        if (texture) SDL_DestroyTexture(texture);
+        texture = nullptr;
+    }
+    if (presentation.separate && presentation.renderers[1])
+        SDL_DestroyRenderer(presentation.renderers[1]);
+    if (presentation.renderers[0])
+        SDL_DestroyRenderer(presentation.renderers[0]);
+    presentation.renderers[0] = nullptr;
+    presentation.renderers[1] = nullptr;
+    if (presentation.separate && presentation.windows[1])
+        SDL_DestroyWindow(presentation.windows[1]);
+    if (presentation.windows[0])
+        SDL_DestroyWindow(presentation.windows[0]);
+    presentation.windows[0] = nullptr;
+    presentation.windows[1] = nullptr;
+}
+
+SDL_Renderer* create_renderer(SDL_Window* window) {
+#if defined(NDS_HAVE_SDL3)
+    // Driver order is NOT left to SDL3's default here. SDL3 orders its Windows
+    // render drivers direct3d11 first; SDL2 ordered direct3d (D3D9) first, and
+    // every release through v0.5.2 was tuned against that. Measured on this
+    // workstation over 600 presented frames of the direct-boot soak:
+    //
+    //   SDL2 (D3D9)      swap 0.147 s   0.25 ms/frame
+    //   SDL3 direct3d    swap 0.175 s   0.29 ms/frame
+    //   SDL3 direct3d11  swap 2.219 s   3.70 ms/frame   <- SDL3's default
+    //   SDL3 direct3d12  swap 2.639 s   4.40 ms/frame
+    //
+    // The cost is not vsync (SDL_RENDER_VSYNC=0 and =1 measure the same); it is
+    // intrinsic to the D3D11 present path. This frontend's pacing clock is the
+    // audio queue, so a multi-millisecond present is taken straight out of the
+    // frame budget and surfaces as audio underruns -- SDL3-on-D3D11 underran a
+    // 2,400-frame soak that SDL2 and SDL3-on-D3D9 both complete clean.
+    //
+    // So: ask for the driver SDL2 would have picked, and fall through to SDL3's
+    // own choice wherever it does not exist (Linux, macOS), then to software.
+    // NDS_SDL_RENDER_DRIVER forces a specific driver for diagnosis.
+    SDL_Renderer* renderer = nullptr;
+    if (const char* forced = std::getenv("NDS_SDL_RENDER_DRIVER")) {
+        if (forced[0] != '\0') {
+            renderer = SDL_CreateRenderer(window, forced);
+            if (!renderer)
+                std::fprintf(stderr,
+                    "[sdl] render driver '%s' unavailable: %s\n",
+                    forced, SDL_GetError());
+        }
+    }
+    if (!renderer) renderer = SDL_CreateRenderer(window, "direct3d");
+    if (!renderer) renderer = SDL_CreateRenderer(window, nullptr);
+    if (!renderer)
+        renderer = SDL_CreateRenderer(window, "software");
+    if (renderer) {
+        const char* name = SDL_GetRendererName(renderer);
+        std::fprintf(stderr, "[sdl] render driver: %s\n",
+                     name ? name : "(unknown)");
+    }
+#else
+    SDL_Renderer* renderer = SDL_CreateRenderer(
+        window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
+    if (!renderer)
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+#endif
+    return renderer;
+}
+
+SDL_Window* create_window(const char* title, int x, int y, int w, int h,
+                          uint64_t flags) {
+#if defined(NDS_HAVE_SDL3)
+    SDL_Window* window = SDL_CreateWindow(
+        title, w, h, static_cast<SDL_WindowFlags>(flags));
+    if (window)
+        SDL_SetWindowPosition(window, x, y);
+    return window;
+#else
+    return SDL_CreateWindow(title, x, y, w, h, static_cast<uint32_t>(flags));
+#endif
+}
+
+bool set_window_fullscreen(SDL_Window* window, NdsFullscreenMode mode) {
+#if defined(NDS_HAVE_SDL3)
+    return SDL_SetWindowFullscreen(window, mode != NdsFullscreenMode::Off);
+#else
+    return SDL_SetWindowFullscreen(window, fullscreen_flags(mode)) == 0;
+#endif
+}
+
+bool set_render_logical_size(SDL_Renderer* renderer, int width, int height) {
+#if defined(NDS_HAVE_SDL3)
+    return SDL_SetRenderLogicalPresentation(
+        renderer, width, height, SDL_LOGICAL_PRESENTATION_INTEGER_SCALE);
+#else
+    return SDL_RenderSetLogicalSize(renderer, width, height) == 0;
+#endif
+}
+
+// Current refresh rate of the display the window sits on, in whole Hz, or 0
+// when SDL cannot answer (SDL_GetError() then carries the reason). The frame
+// interpolation gate is the only consumer: it refuses to insert a synthetic
+// present unless the panel is comfortably above 60 Hz.
+int window_refresh_hz(SDL_Window* window) {
+#if defined(NDS_HAVE_SDL3)
+    const SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+    if (display == 0) return 0;
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display);
+    if (!mode) return 0;
+    // SDL3 reports refresh_rate as a float (e.g. 164.998); round to the
+    // nearest whole Hz so the >= comparison against the integer gate behaves
+    // the same as SDL2's integer report.
+    return static_cast<int>(std::lround(mode->refresh_rate));
+#else
+    const int display_index = SDL_GetWindowDisplayIndex(window);
+    if (display_index < 0) return 0;
+    SDL_DisplayMode mode{};
+    if (SDL_GetCurrentDisplayMode(display_index, &mode) != 0) return 0;
+    return mode.refresh_rate;
+#endif
+}
+
+void convert_mouse_event_to_logical_coordinates(
+    SDL_Event& event, const FrontendPresentation& presentation) {
+#if defined(NDS_HAVE_SDL3)
+    auto renderer_for_window = [&](uint32_t window_id) -> SDL_Renderer* {
+        for (int screen = 0; screen < 2; ++screen) {
+            if (window_id == presentation.window_ids[screen])
+                return presentation.renderers[screen];
+        }
+        return nullptr;
+    };
+    if (event.type == SDL_MOUSEBUTTONDOWN ||
+        event.type == SDL_MOUSEBUTTONUP) {
+        if (SDL_Renderer* renderer =
+                renderer_for_window(event.button.windowID)) {
+            float x = event.button.x;
+            float y = event.button.y;
+            if (SDL_RenderCoordinatesFromWindow(
+                    renderer, event.button.x, event.button.y, &x, &y)) {
+                event.button.x = x;
+                event.button.y = y;
+            }
+        }
+    } else if (event.type == SDL_MOUSEMOTION) {
+        if (SDL_Renderer* renderer =
+                renderer_for_window(event.motion.windowID)) {
+            float x = event.motion.x;
+            float y = event.motion.y;
+            if (SDL_RenderCoordinatesFromWindow(
+                    renderer, event.motion.x, event.motion.y, &x, &y)) {
+                event.motion.x = x;
+                event.motion.y = y;
+            }
+        }
+    }
+#else
+    (void)event;
+    (void)presentation;
+#endif
+}
+
+bool set_texture_scale_nearest(SDL_Texture* texture) {
+#if defined(NDS_HAVE_SDL3)
+    return SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST);
+#else
+    return SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest) == 0;
+#endif
+}
+
+void render_texture(SDL_Renderer* renderer, SDL_Texture* texture,
+                    const SDL_Rect* destination) {
+#if defined(NDS_HAVE_SDL3)
+    SDL_FRect dst{};
+    const SDL_FRect* dst_ptr = nullptr;
+    if (destination) {
+        dst.x = static_cast<float>(destination->x);
+        dst.y = static_cast<float>(destination->y);
+        dst.w = static_cast<float>(destination->w);
+        dst.h = static_cast<float>(destination->h);
+        dst_ptr = &dst;
+    }
+    SDL_RenderTexture(renderer, texture, nullptr, dst_ptr);
+#else
+    SDL_RenderCopy(renderer, texture, nullptr, destination);
+#endif
+}
+
+void render_line(SDL_Renderer* renderer, int x1, int y1, int x2, int y2) {
+#if defined(NDS_HAVE_SDL3)
+    SDL_RenderLine(renderer, static_cast<float>(x1), static_cast<float>(y1),
+                   static_cast<float>(x2), static_cast<float>(y2));
+#else
+    SDL_RenderDrawLine(renderer, x1, y1, x2, y2);
+#endif
+}
+
+void fill_rect(SDL_Renderer* renderer, const SDL_Rect& rect) {
+#if defined(NDS_HAVE_SDL3)
+    const SDL_FRect frect{static_cast<float>(rect.x),
+                          static_cast<float>(rect.y),
+                          static_cast<float>(rect.w),
+                          static_cast<float>(rect.h)};
+    SDL_RenderFillRect(renderer, &frect);
+#else
+    SDL_RenderFillRect(renderer, &rect);
+#endif
+}
+
+const char* notice_glyph(char ch) {
+    switch (static_cast<char>(std::toupper(static_cast<unsigned char>(ch)))) {
+        case 'A': return "01110100011000111111100011000110001";
+        case 'B': return "11110100011000111110100011000111110";
+        case 'C': return "01111100001000010000100001000001111";
+        case 'D': return "11110100011000110001100011000111110";
+        case 'E': return "11111100001000011110100001000011111";
+        case 'F': return "11111100001000011110100001000010000";
+        case 'G': return "01111100001000010111100011000101111";
+        case 'H': return "10001100011000111111100011000110001";
+        case 'I': return "11111001000010000100001000010011111";
+        case 'J': return "00111000100001000010100101001001100";
+        case 'K': return "10001100101010011000101001001010001";
+        case 'L': return "10000100001000010000100001000011111";
+        case 'M': return "10001110111010110101100011000110001";
+        case 'N': return "10001110011010110011100011000110001";
+        case 'O': return "01110100011000110001100011000101110";
+        case 'P': return "11110100011000111110100001000010000";
+        case 'Q': return "01110100011000110001101011001001101";
+        case 'R': return "11110100011000111110101001001010001";
+        case 'S': return "01111100001000001110000010000111110";
+        case 'T': return "11111001000010000100001000010000100";
+        case 'U': return "10001100011000110001100011000101110";
+        case 'V': return "10001100011000110001100010101000100";
+        case 'W': return "10001100011000110101101011101110001";
+        case 'X': return "10001100010101000100010101000110001";
+        case 'Y': return "10001100010101000100001000010000100";
+        case 'Z': return "11111000010001000100010001000011111";
+        case '0': return "01110100011001110101110011000101110";
+        case '1': return "00100011000010000100001000010001110";
+        case '2': return "01110100010000100010001000100011111";
+        case '3': return "11110000010000101110000010000111110";
+        case '4': return "00010001100101010010111110001000010";
+        case '5': return "11111100001000011110000010000111110";
+        case '6': return "01110100001000011110100011000101110";
+        case '7': return "11111000010001000100010000100001000";
+        case '8': return "01110100011000101110100011000101110";
+        case '9': return "01110100011000101111000010000101110";
+        case ':': return "00000001000010000000001000010000000";
+        case '.': return "00000000000000000000000000010000100";
+        case '-': return "00000000000000011111000000000000000";
+        case '/': return "00001000100001000100010001000010000";
+        case '(': return "00010001000100001000010000010000010";
+        case ')': return "01000001000001000010000100010001000";
+        case '_': return "00000000000000000000000000000011111";
+        case ' ': return "00000000000000000000000000000000000";
+        default:  return "01110000010001000100001000000000100";
+    }
+}
+
+void draw_savestate_notice(SDL_Renderer* renderer,
+                           const SDL_Rect& screen,
+                           const char* text) {
+    if (!renderer || !text || !*text) return;
+    constexpr int kColumns = 40;
+    constexpr int kRows = 5;
+    constexpr int kGlyphWidth = 6;
+    constexpr int kGlyphHeight = 8;
+    const SDL_Rect background{screen.x + 5,
+                              screen.y + screen.h - kRows * kGlyphHeight - 5,
+                              kColumns * kGlyphWidth + 6,
+                              kRows * kGlyphHeight + 4};
+    SDL_SetRenderDrawColor(renderer, 10, 10, 10, 255);
+    fill_rect(renderer, background);
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    int row = 0;
+    int column = 0;
+    for (const char* p = text; *p && row < kRows; ++p) {
+        if (*p == '\n' || column == kColumns) {
+            ++row;
+            column = 0;
+            if (*p == '\n') continue;
+            if (row >= kRows) break;
+        }
+        const char* glyph = notice_glyph(*p);
+        for (int gy = 0; gy < 7; ++gy) {
+            for (int gx = 0; gx < 5; ++gx) {
+                if (glyph[gy * 5 + gx] != '1') continue;
+                const SDL_Rect pixel{
+                    background.x + 3 + column * kGlyphWidth + gx,
+                    background.y + 2 + row * kGlyphHeight + gy, 1, 1};
+                fill_rect(renderer, pixel);
+            }
+        }
+        ++column;
+    }
+}
+
+bool create_presentation(const NdsFrontendOptions& options,
+                         FrontendPresentation& presentation,
+                         bool allow_gl_top = true) {
+    presentation.separate =
+        options.screen_layout == NdsScreenLayout::Separate;
+    presentation.single =
+        options.screen_layout == NdsScreenLayout::Single;
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+    const char* direct_selection =
+        std::getenv("NDS_COMPUTE_DIRECT_PRESENT");
+    const bool direct_enabled =
+        !direct_selection || !*direct_selection ||
+        std::strcmp(direct_selection, "1") == 0;
+    const bool direct_top_requested =
+        (options.adaptive_screens & NDS_ADAPTIVE_TOP) != 0u ||
+        options.internal_resolution > 1u;
+    presentation.gl_top = presentation.separate &&
+        allow_gl_top &&
+        direct_top_requested &&
+        nds_gpu3d_renderer_prefers_compute() &&
+        direct_enabled;
+#endif
+    const int aa_scale = options.antialiasing >= 8 ? 4 :
+                         options.antialiasing >= 4 ? 3 :
+                         options.antialiasing >= 2 ? 2 : 1;
+    presentation.configured_sample_scale =
+        std::max<int>(options.supersampling, aa_scale);
+    presentation.sample_scale = presentation.configured_sample_scale;
+    for (int screen = 0; screen < 2; ++screen) {
+        const uint8_t bit = static_cast<uint8_t>(1u << screen);
+        if ((options.adaptive_screens & bit) &&
+            (options.adaptive_supported & bit)) {
+            presentation.screen_widths[screen] =
+                options.adaptive_max_width[screen];
+        }
+    }
+    presentation.canvas_width = std::max(
+        presentation.screen_widths[0],
+        presentation.screen_widths[1]);
+    presentation.canvas_height = kScreenHeight * 2;
+    if (presentation.single) {
+        bool portrait = false;
+        SDL_Rect display_bounds{};
+#if defined(NDS_HAVE_SDL3)
+        if (SDL_GetDisplayBounds(SDL_GetPrimaryDisplay(),
+                                 &display_bounds)) {
+            portrait = display_bounds.h > display_bounds.w;
+        }
+#else
+        if (SDL_GetDisplayBounds(0, &display_bounds) == 0) {
+            portrait = display_bounds.h > display_bounds.w;
+        }
+#endif
+        if (const char* forced = std::getenv("NDS_SINGLE_PORTRAIT")) {
+            portrait = forced[0] == '1';
+        }
+        presentation.single_portrait = portrait;
+        const bool virtual_strip =
+            options.virtual_controls != NdsVirtualControlsMode::Off;
+        if (portrait) {
+            presentation.canvas_width = std::max(
+                kSinglePortraitWidth,
+                std::max(presentation.screen_widths[0],
+                         presentation.screen_widths[1]));
+            presentation.canvas_height =
+                kScreenHeight * 2 +
+                (virtual_strip ? kVirtualControlsHeight : 0);
+        } else {
+            presentation.canvas_width = std::max(
+                kSingleCanvasWidth,
+                presentation.screen_widths[0] + 32 + kSingleBottomWidth);
+            presentation.canvas_width = std::max(
+                presentation.canvas_width, presentation.screen_widths[1]);
+            presentation.canvas_height =
+                kScreenHeight +
+                (virtual_strip ? kVirtualControlsHeight : 0);
+        }
+    }
+    const int first_height = presentation.separate
+        ? kScreenHeight * kWindowScale
+        : (presentation.single ? presentation.canvas_height
+                               : kScreenHeight * 2) * kWindowScale;
+    const uint64_t top_window_flags =
+        SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
+        (presentation.gl_top
+             ? static_cast<uint64_t>(SDL_WINDOW_OPENGL) : 0u);
+    presentation.windows[0] = create_window(
+        presentation.separate ? "ndsrecomp - Top Screen"
+                               : (presentation.single
+                                      ? "ndsrecomp - Single Screen"
+                                      : "ndsrecomp firmware preview"),
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        (presentation.separate ? presentation.screen_widths[0]
+                               : presentation.canvas_width) * kWindowScale,
+        first_height,
+        top_window_flags);
+    if (!presentation.windows[0]) {
+        std::fprintf(stderr, "[sdl] window failed: %s\n", SDL_GetError());
+        return false;
+    }
+    if (!presentation.gl_top) {
+        presentation.renderers[0] = create_renderer(presentation.windows[0]);
+        if (!presentation.renderers[0]) {
+            std::fprintf(stderr, "[sdl] renderer failed: %s\n", SDL_GetError());
+            destroy_presentation(presentation);
+            return false;
+        }
+    }
+
+    if (presentation.separate) {
+        int top_x = 0;
+        int top_y = 0;
+        SDL_GetWindowPosition(presentation.windows[0], &top_x, &top_y);
+        presentation.windows[1] = create_window(
+            "ndsrecomp - Bottom Screen",
+            top_x + presentation.screen_widths[0] * kWindowScale + 32,
+            top_y,
+            presentation.screen_widths[1] * kWindowScale,
+            kScreenHeight * kWindowScale,
+            SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+        if (!presentation.windows[1]) {
+            std::fprintf(stderr, "[sdl] bottom window failed: %s\n",
+                         SDL_GetError());
+            destroy_presentation(presentation);
+            return false;
+        }
+        presentation.renderers[1] =
+            create_renderer(presentation.windows[1]);
+        if (!presentation.renderers[1]) {
+            std::fprintf(stderr, "[sdl] bottom renderer failed: %s\n",
+                         SDL_GetError());
+            destroy_presentation(presentation);
+            return false;
+        }
+    } else {
+        presentation.windows[1] = presentation.windows[0];
+        presentation.renderers[1] = presentation.renderers[0];
+    }
+
+    // Fullscreen is applied only after both separate-layout windows have their
+    // final placement. The primary combined/top window is deliberately the
+    // sole target so the separate touch window remains usable.
+    if (!set_window_fullscreen(presentation.windows[0], options.fullscreen)) {
+        std::fprintf(stderr, "[sdl] fullscreen (%s) failed: %s\n",
+                     nds_fullscreen_mode_name(options.fullscreen),
+                     SDL_GetError());
+        destroy_presentation(presentation);
+        return false;
+    }
+
+    for (int screen = 0; screen < 2; ++screen) {
+        if (screen == 0 && presentation.gl_top) {
+            presentation.window_ids[screen] =
+                SDL_GetWindowID(presentation.windows[screen]);
+            continue;
+        }
+        const int logical_height =
+            presentation.single
+                ? presentation.canvas_height
+                : (!presentation.separate && screen == 0
+                       ? kScreenHeight * 2 : kScreenHeight);
+        if (screen == 0 || presentation.separate) {
+            set_render_logical_size(
+                presentation.renderers[screen],
+                presentation.separate
+                    ? presentation.screen_widths[screen]
+                    : presentation.canvas_width,
+                logical_height);
+#if !defined(NDS_HAVE_SDL3)
+            SDL_RenderSetIntegerScale(presentation.renderers[screen],
+                                      SDL_TRUE);
+#endif
+        }
+        presentation.textures[screen] = SDL_CreateTexture(
+            presentation.renderers[screen], SDL_PIXELFORMAT_ARGB8888,
+            SDL_TEXTUREACCESS_STREAMING,
+            presentation.screen_widths[screen], kScreenHeight);
+        if (!presentation.textures[screen]) {
+            std::fprintf(stderr, "[sdl] texture failed: %s\n",
+                         SDL_GetError());
+            destroy_presentation(presentation);
+            return false;
+        }
+        if (!set_texture_scale_nearest(presentation.textures[screen])) {
+            std::fprintf(stderr, "[sdl] texture scale mode failed: %s\n",
+                         SDL_GetError());
+            destroy_presentation(presentation);
+            return false;
+        }
+        if (presentation.sample_scale > 1) {
+            presentation.sample_targets[screen] = SDL_CreateTexture(
+                presentation.renderers[screen], SDL_PIXELFORMAT_ARGB8888,
+                SDL_TEXTUREACCESS_TARGET,
+                presentation.screen_widths[screen] *
+                    presentation.sample_scale,
+                kScreenHeight * presentation.sample_scale);
+            if (!presentation.sample_targets[screen]) {
+                std::fprintf(stderr,
+                             "[sdl] supersample target failed: %s\n",
+                             SDL_GetError());
+                destroy_presentation(presentation);
+                return false;
+            }
+            if (!set_texture_scale_nearest(
+                    presentation.sample_targets[screen])) {
+                std::fprintf(
+                    stderr,
+                    "[sdl] supersample target scale mode failed: %s\n",
+                    SDL_GetError());
+                destroy_presentation(presentation);
+                return false;
+            }
+        }
+        presentation.window_ids[screen] =
+            SDL_GetWindowID(presentation.windows[screen]);
+    }
+    return true;
+}
+
+void render_screen(FrontendPresentation& presentation, int screen,
+                   const SDL_Rect& destination) {
+    SDL_Renderer* renderer = presentation.renderers[screen];
+    SDL_Texture* source = presentation.textures[screen];
+    if (presentation.sample_scale > 1 && presentation.sample_targets[screen]) {
+        SDL_SetRenderTarget(renderer, presentation.sample_targets[screen]);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        render_texture(renderer, source, nullptr);
+        SDL_SetRenderTarget(renderer, nullptr);
+        source = presentation.sample_targets[screen];
+    }
+    render_texture(renderer, source, &destination);
+}
+
+enum VirtualButtonIndex : int {
+    VB_UP = 0, VB_DOWN, VB_LEFT, VB_RIGHT,
+    VB_A, VB_B, VB_X, VB_Y,
+    VB_L, VB_R, VB_START, VB_SELECT, VB_COUNT
+};
+
+struct VirtualButtonState {
+    bool held = false;
+    float anim = 0.0f;
+    float velocity = 0.0f;
+};
+
+struct VirtualControlsState {
+    VirtualButtonState buttons[VB_COUNT];
+    int mouse_button = -1;
+    int finger_button[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    int64_t finger_id[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    bool visible = false;
+};
+
+struct VirtualButtonRect {
+    float x = 0.0f;
+    float y = 0.0f;
+    float radius = 0.0f;
+};
+
+constexpr uint16_t kVirtualBits[VB_COUNT] = {
+    1u << 6, 1u << 7, 1u << 5, 1u << 4,
+    1u << 0, 1u << 1, 1u << 10, 1u << 11,
+    1u << 8, 1u << 9, 1u << 3, 1u << 2,
+};
+
+const char* virtual_button_label(int index) {
+    static const char* labels[VB_COUNT] = {
+        "U", "D", "L", "R", "A", "B", "X", "Y", "L", "R", "ST", "SE",
+    };
+    return index >= 0 && index < VB_COUNT ? labels[index] : "?";
+}
+
+void virtual_control_rects(const struct FrontendPresentation& presentation,
+                           VirtualButtonRect out[VB_COUNT]) {
+    const bool portrait = presentation.single_portrait;
+    const float game_h = portrait ? kScreenHeight * 2.0f
+                                  : static_cast<float>(kScreenHeight);
+    const float strip_y = game_h;
+    if (presentation.fold_split) {
+        const SDL_Rect& panel = presentation.layout_controls;
+        const float panel_w = static_cast<float>(std::max(1, panel.w));
+        const float panel_h = static_cast<float>(std::max(1, panel.h));
+        const float radius = std::clamp(
+            std::min(panel_w, panel_h) * 0.075f, 10.0f, 20.0f);
+        const float offset = radius * 1.7f;
+        const float dpad_x = panel.x + panel_w * 0.25f;
+        const float face_x = panel.x + panel_w * 0.75f;
+        const float center_y = panel.y + panel_h * 0.48f;
+        out[VB_UP] = {dpad_x, center_y - offset, radius};
+        out[VB_DOWN] = {dpad_x, center_y + offset, radius};
+        out[VB_LEFT] = {dpad_x - offset, center_y, radius};
+        out[VB_RIGHT] = {dpad_x + offset, center_y, radius};
+        out[VB_Y] = {face_x, center_y - offset, radius};
+        out[VB_X] = {face_x - offset, center_y, radius};
+        out[VB_B] = {face_x, center_y + offset, radius};
+        out[VB_A] = {face_x + offset, center_y, radius};
+        out[VB_L] = {panel.x + radius + 4.0f,
+                     panel.y + radius + 4.0f, radius * 0.85f};
+        out[VB_R] = {panel.x + panel_w - radius - 4.0f,
+                     panel.y + radius + 4.0f, radius * 0.85f};
+        out[VB_START] = {panel.x + panel_w * 0.5f - radius * 1.8f,
+                         panel.y + panel_h - radius * 1.4f,
+                         radius * 0.9f};
+        out[VB_SELECT] = {panel.x + panel_w * 0.5f + radius * 1.8f,
+                          panel.y + panel_h - radius * 1.4f,
+                          radius * 0.9f};
+        return;
+    }
+    if (portrait) {
+        const float dpad_x = 56.0f;
+        const float dpad_y = strip_y + 48.0f;
+        out[VB_UP] = {dpad_x, dpad_y - 28.0f, 18.0f};
+        out[VB_DOWN] = {dpad_x, dpad_y + 28.0f, 18.0f};
+        out[VB_LEFT] = {dpad_x - 28.0f, dpad_y, 18.0f};
+        out[VB_RIGHT] = {dpad_x + 28.0f, dpad_y, 18.0f};
+        const float face_x = presentation.canvas_width - 56.0f;
+        const float face_y = dpad_y;
+        out[VB_Y] = {face_x, face_y - 34.0f, 18.0f};
+        out[VB_X] = {face_x - 34.0f, face_y, 18.0f};
+        out[VB_B] = {face_x, face_y + 34.0f, 18.0f};
+        out[VB_A] = {face_x + 34.0f, face_y, 18.0f};
+        out[VB_L] = {20.0f, strip_y + 18.0f, 15.0f};
+        out[VB_R] = {presentation.canvas_width - 20.0f,
+                     strip_y + 18.0f, 15.0f};
+        out[VB_START] = {presentation.canvas_width * 0.5f - 28.0f,
+                         strip_y + 76.0f, 14.0f};
+        out[VB_SELECT] = {presentation.canvas_width * 0.5f + 28.0f,
+                          strip_y + 76.0f, 14.0f};
+    } else {
+        const float dpad_x = 56.0f;
+        const float dpad_y = strip_y + 46.0f;
+        out[VB_UP] = {dpad_x, dpad_y - 24.0f, 15.0f};
+        out[VB_DOWN] = {dpad_x, dpad_y + 24.0f, 15.0f};
+        out[VB_LEFT] = {dpad_x - 24.0f, dpad_y, 15.0f};
+        out[VB_RIGHT] = {dpad_x + 24.0f, dpad_y, 15.0f};
+        const float face_x = presentation.canvas_width - 64.0f;
+        const float face_y = dpad_y;
+        out[VB_Y] = {face_x, face_y - 30.0f, 16.0f};
+        out[VB_X] = {face_x - 30.0f, face_y, 16.0f};
+        out[VB_B] = {face_x, face_y + 30.0f, 16.0f};
+        out[VB_A] = {face_x + 30.0f, face_y, 16.0f};
+        out[VB_L] = {18.0f, strip_y + 16.0f, 13.0f};
+        out[VB_R] = {presentation.canvas_width - 18.0f,
+                     strip_y + 16.0f, 13.0f};
+        out[VB_START] = {presentation.canvas_width * 0.5f - 26.0f,
+                         strip_y + 34.0f, 13.0f};
+        out[VB_SELECT] = {presentation.canvas_width * 0.5f + 26.0f,
+                          strip_y + 34.0f, 13.0f};
+    }
+}
+
+int virtual_control_at(const struct FrontendPresentation& presentation,
+                       float x, float y) {
+    VirtualButtonRect rects[VB_COUNT];
+    virtual_control_rects(presentation, rects);
+    for (int i = 0; i < VB_COUNT; ++i) {
+        const float dx = x - rects[i].x;
+        const float dy = y - rects[i].y;
+        const float radius = rects[i].radius + 6.0f;
+        if (dx * dx + dy * dy <= radius * radius) return i;
+    }
+    return -1;
+}
+
+uint16_t virtual_controls_mask(const VirtualControlsState& state) {
+    uint16_t mask = 0;
+    for (int i = 0; i < VB_COUNT; ++i) {
+        if (state.buttons[i].held) mask |= kVirtualBits[i];
+    }
+    return mask;
+}
+
+void fill_circle(SDL_Renderer* renderer, float cx, float cy, float radius,
+                 Uint8 r, Uint8 g, Uint8 b, Uint8 a) {
+    SDL_SetRenderDrawColor(renderer, r, g, b, a);
+    const int top = static_cast<int>(std::floor(cy - radius));
+    const int bottom = static_cast<int>(std::ceil(cy + radius));
+    for (int y = top; y <= bottom; ++y) {
+        const float dy = static_cast<float>(y) + 0.5f - cy;
+        if (std::fabs(dy) > radius) continue;
+        const float half = std::sqrt(std::max(0.0f, radius * radius - dy * dy));
+        SDL_FRect line{std::floor(cx - half), static_cast<float>(y),
+                       std::ceil(half * 2.0f), 1.0f};
+        SDL_RenderFillRect(renderer, &line);
+    }
+}
+
+void draw_virtual_label(SDL_Renderer* renderer, const char* text,
+                        float cx, float cy, float scale) {
+    const int text_len = static_cast<int>(std::strlen(text));
+    const float char_w = 5.0f * scale + scale;
+    float x = cx - (text_len * char_w - scale) * 0.5f;
+    SDL_SetRenderDrawColor(renderer, 245, 248, 255, 255);
+    for (const char* p = text; *p; ++p) {
+        const char* glyph = notice_glyph(*p);
+        for (int gy = 0; gy < 7; ++gy) {
+            for (int gx = 0; gx < 5; ++gx) {
+                if (glyph[gy * 5 + gx] != '1') continue;
+                SDL_FRect pixel{x + gx * scale,
+                                cy - 3.5f * scale + gy * scale,
+                                scale, scale};
+                SDL_RenderFillRect(renderer, &pixel);
+            }
+        }
+        x += char_w;
+    }
+}
+
+void draw_virtual_controls(SDL_Renderer* renderer,
+                           const struct FrontendPresentation& presentation,
+                           VirtualControlsState& state) {
+    if (!presentation.single || !state.visible) return;
+    VirtualButtonRect rects[VB_COUNT];
+    virtual_control_rects(presentation, rects);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 8, 12, 20, 150);
+    SDL_FRect strip{};
+    if (presentation.fold_split) {
+        strip = SDL_FRect{
+            static_cast<float>(presentation.layout_controls.x),
+            static_cast<float>(presentation.layout_controls.y),
+            static_cast<float>(presentation.layout_controls.w),
+            static_cast<float>(presentation.layout_controls.h)};
+    } else {
+        const float game_h = presentation.single_portrait
+            ? kScreenHeight * 2.0f
+            : static_cast<float>(kScreenHeight);
+        strip = SDL_FRect{
+            0.0f, game_h, static_cast<float>(presentation.canvas_width),
+            static_cast<float>(presentation.canvas_height) - game_h};
+    }
+    SDL_RenderFillRect(renderer, &strip);
+    for (int i = 0; i < VB_COUNT; ++i) {
+        VirtualButtonState& button = state.buttons[i];
+        const float target = button.held ? 1.0f : 0.0f;
+        button.velocity += (target - button.anim) * 0.38f;
+        button.velocity *= 0.70f;
+        button.anim += button.velocity;
+        button.anim = std::clamp(button.anim, 0.0f, 1.0f);
+        const float radius = rects[i].radius * (1.0f + 0.14f * button.anim);
+        if (button.anim > 0.01f) {
+            fill_circle(renderer, rects[i].x, rects[i].y, radius + 5.0f,
+                        90, 210, 255,
+                        static_cast<Uint8>(40.0f + 70.0f * button.anim));
+        }
+        fill_circle(renderer, rects[i].x, rects[i].y, radius,
+                    22, 28, 40, 225);
+        fill_circle(renderer, rects[i].x, rects[i].y, radius - 2.0f,
+                    44, 56, 76, button.held ? 235 : 190);
+        SDL_SetRenderDrawColor(renderer, 130, 215, 255,
+                               button.held ? 255 : 170);
+        // Outline ring, drawn as a thin circle.
+        for (int step = 0; step < 48; ++step) {
+            const float angle = static_cast<float>(step) * 6.2831853f / 48.0f;
+            const float x = rects[i].x + std::cos(angle) * radius;
+            const float y = rects[i].y + std::sin(angle) * radius;
+            SDL_FRect px{x, y, 1.5f, 1.5f};
+            SDL_RenderFillRect(renderer, &px);
+        }
+        draw_virtual_label(renderer, virtual_button_label(i),
+                           rects[i].x, rects[i].y,
+                           radius >= 17.0f ? 2.0f : 1.6f);
+    }
+}
+
+// All-or-nothing. The only fallible step is the renderer rebuild, so it runs
+// FIRST and nothing else is touched until it has succeeded: a failed apply
+// leaves the readback latency, the sample scale and the HD emit flag exactly
+// as the currently installed stage left them, so the caller can report the
+// stage that is actually running.
+bool apply_performance_governor_stage(
+        const NdsFrontendOptions& options,
+        FrontendPresentation& presentation,
+        uint8_t stage) {
+    const uint8_t target_scale =
+        stage >= 2u ? 1u : options.internal_resolution;
+    if (!nds_gpu3d_set_runtime_internal_scale(target_scale)) {
+        std::fprintf(stderr,
+                     "[governor] could not apply internal scale %u\n",
+                     static_cast<unsigned>(target_scale));
+        return false;
+    }
+    nds_gpu3d_set_display_readback_latency(stage >= 1u);
+    presentation.sample_scale =
+        stage >= 2u ? 1 : presentation.configured_sample_scale;
+    nds_gpu2d_set_hd_emit(target_scale > 1u && presentation.gl_top);
+    return true;
+}
+
+void draw_virtual_stylus(SDL_Renderer* renderer, const SDL_Rect& destination,
+                         float stylus_x, float stylus_y) {
+    const int x = destination.x + static_cast<int>(
+        std::lround(stylus_x * destination.w / 256.0f));
+    const int y = destination.y + static_cast<int>(
+        std::lround(stylus_y * destination.h / 192.0f));
+
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+    render_line(renderer, x - 5, y, x - 2, y);
+    render_line(renderer, x + 2, y, x + 5, y);
+    render_line(renderer, x, y - 5, x, y - 2);
+    render_line(renderer, x, y + 2, x, y + 5);
+}
+
+bool frontend_shot_frame(uint64_t frame) {
+    static const std::string spec = [] {
+        const char* value = std::getenv("NDS_FRONTEND_SHOT_AT");
+        return value ? std::string(value) : std::string();
+    }();
+    if (spec.empty() || frame == 0) return false;
+    const char* cursor = spec.c_str();
+    while (*cursor) {
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(cursor, &end, 0);
+        if (end == cursor) break;
+        if (value == frame) return true;
+        cursor = end;
+        while (*cursor == ',' || *cursor == ' ' || *cursor == '\t') ++cursor;
+    }
+    return false;
+}
+
+void save_frontend_shot(SDL_Renderer* renderer, uint64_t frame,
+                        const char* suffix = "", bool force = false) {
+    if (!renderer || !(force || frontend_shot_frame(frame))) return;
+    const char* directory = std::getenv("NDS_FRONTEND_SHOT_DIR");
+    if (!directory || !*directory) return;
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+#if defined(NDS_HAVE_SDL3)
+    SDL_Surface* surface = SDL_RenderReadPixels(renderer, nullptr);
+    if (!surface) return;
+    char name[64];
+    // A forced shot is not tied to a frame number, so it gets its own name; the
+    // menu is a host overlay and never appears in the guest framebuffer, so a
+    // window readback is the only way to record that it drew at all.
+    if (force) {
+        static unsigned forced_index = 0;
+        std::snprintf(name, sizeof(name), "shot-%03u%s.bmp",
+                      forced_index++, suffix);
+    } else {
+        std::snprintf(name, sizeof(name), "frame-%06llu%s.bmp",
+                      static_cast<unsigned long long>(frame), suffix);
+    }
+    const std::filesystem::path path =
+        std::filesystem::path(directory) / name;
+    SDL_SaveBMP(surface, path.string().c_str());
+    SDL_DestroySurface(surface);
+#else
+    int width = 0;
+    int height = 0;
+    if (SDL_GetRendererOutputSize(renderer, &width, &height) != 0 ||
+        width <= 0 || height <= 0) {
+        return;
+    }
+    SDL_Surface* surface = SDL_CreateRGBSurfaceWithFormat(
+        0, width, height, 32, SDL_PIXELFORMAT_ARGB8888);
+    if (!surface) return;
+    if (SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_ARGB8888,
+                             surface->pixels, surface->pitch) == 0) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "frame-%06llu%s.bmp",
+                      static_cast<unsigned long long>(frame), suffix);
+        const std::filesystem::path path =
+            std::filesystem::path(directory) / name;
+        SDL_SaveBMP(surface, path.string().c_str());
+    }
+    SDL_FreeSurface(surface);
+#endif
+}
+
+uint16_t scripted_key_mask(uint64_t frame) {
+    // Deterministic host input for layout/audit runs:
+    //   NDS_FRONTEND_INPUT="1201:8,1211:0,1501:8,1511:0"
+    // Each entry is frame:active-high-pressed-mask (bit 0=A ... bit 11=Y).
+    static const std::string spec = [] {
+        const char* value = std::getenv("NDS_FRONTEND_INPUT");
+        return value ? std::string(value) : std::string();
+    }();
+    if (spec.empty() || frame == 0) return 0;
+    const char* cursor = spec.c_str();
+    uint16_t mask = 0;
+    while (*cursor) {
+        char* end = nullptr;
+        const unsigned long long at = std::strtoull(cursor, &end, 0);
+        if (end == cursor) break;
+        cursor = end;
+        while (*cursor == ':' || *cursor == ' ' || *cursor == '\t') ++cursor;
+        char* mask_end = nullptr;
+        const unsigned long long value = std::strtoull(cursor, &mask_end, 0);
+        if (mask_end == cursor) break;
+        cursor = mask_end;
+        if (at == frame) mask = static_cast<uint16_t>(value & 0x0FFFu);
+        while (*cursor == ',' || *cursor == ' ' || *cursor == '\t') ++cursor;
+    }
+    return mask;
+}
+
+struct PresentationTicks {
+    uint64_t upload = 0;
+    uint64_t draw = 0;
+    uint64_t swap = 0;
+    bool ok = true;
+};
+
+PresentationTicks present_screens(FrontendPresentation& presentation,
+                                  const uint32_t* top_pixels,
+                                  int top_width,
+                                  const uint32_t* bottom_pixels,
+                                  int bottom_width,
+                                  RecompRuntimeUi* runtime_ui,
+                                  bool virtual_stylus_visible,
+                                  float virtual_stylus_x,
+                                  float virtual_stylus_y,
+                                  const char* savestate_notice,
+                                  int color_mode,
+                                  bool lcd_grid,
+                                  VirtualControlsState& virtual_controls,
+                                  uint64_t frame_number) {
+    PresentationTicks ticks{};
+    // Display post-processing happens once, here, on exactly the surfaces this
+    // call is about to upload. Both the real frame and the interpolated one
+    // come through this function, so a synthetic frame cannot be presented
+    // unfiltered while the real one is filtered.
+    top_pixels = filtered_screen(top_pixels, 0, top_width, kScreenHeight,
+                                 color_mode, lcd_grid);
+    bottom_pixels = filtered_screen(bottom_pixels, 1, bottom_width,
+                                    kScreenHeight, color_mode, lcd_grid);
+    if (presentation.gl_top) {
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+        NdsGpu2dDirectFrame direct_frame{};
+        const bool direct = nds_gpu2d_direct_frame(&direct_frame);
+        NdsComputePresentTicks gl_ticks{};
+        if (!nds_compute_host_present_top(
+                top_pixels, static_cast<uint16_t>(top_width),
+                direct ? &direct_frame : nullptr, &gl_ticks)) {
+            std::fprintf(stderr, "[gpu3d] direct top presentation failed\n");
+            ticks.ok = false;
+            return ticks;
+        }
+        ticks.upload += gl_ticks.upload;
+        ticks.draw += gl_ticks.draw;
+        ticks.swap += gl_ticks.swap;
+        bottom_pixels = runtime_menu_overlay(
+            runtime_ui, bottom_pixels, bottom_width, kScreenHeight);
+        uint64_t start = SDL_GetPerformanceCounter();
+        SDL_UpdateTexture(presentation.textures[1], nullptr, bottom_pixels,
+                          bottom_width * sizeof(uint32_t));
+        ticks.upload += SDL_GetPerformanceCounter() - start;
+        const SDL_Rect screen_rect{
+            0, 0, presentation.screen_widths[1], kScreenHeight};
+        SDL_Renderer* renderer = presentation.renderers[1];
+        start = SDL_GetPerformanceCounter();
+        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+        SDL_RenderClear(renderer);
+        render_screen(presentation, 1, screen_rect);
+        if (virtual_stylus_visible)
+            draw_virtual_stylus(renderer, screen_rect,
+                                virtual_stylus_x, virtual_stylus_y);
+        draw_savestate_notice(renderer, screen_rect, savestate_notice);
+        ticks.draw += SDL_GetPerformanceCounter() - start;
+        start = SDL_GetPerformanceCounter();
+        save_frontend_shot(renderer, frame_number, "", take_forced_shot(true));
+        SDL_RenderPresent(renderer);
+        ticks.swap += SDL_GetPerformanceCounter() - start;
+#endif
+        return ticks;
+    }
+    top_pixels = runtime_menu_overlay(
+        runtime_ui, top_pixels, top_width, kScreenHeight);
+    uint64_t start = SDL_GetPerformanceCounter();
+    SDL_UpdateTexture(presentation.textures[0], nullptr, top_pixels,
+                      top_width * sizeof(uint32_t));
+    SDL_UpdateTexture(presentation.textures[1], nullptr, bottom_pixels,
+                      bottom_width * sizeof(uint32_t));
+    ticks.upload += SDL_GetPerformanceCounter() - start;
+    if (!presentation.separate) {
+        SDL_Renderer* renderer = presentation.renderers[0];
+        start = SDL_GetPerformanceCounter();
+        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+        SDL_RenderClear(renderer);
+        const SDL_Rect top_rect = presentation.single
+            ? presentation.layout_top
+            : SDL_Rect{(presentation.canvas_width -
+                            presentation.screen_widths[0]) / 2,
+                       0, presentation.screen_widths[0], kScreenHeight};
+        const SDL_Rect bottom_rect = presentation.single
+            ? presentation.layout_bottom
+            : SDL_Rect{(presentation.canvas_width -
+                            presentation.screen_widths[1]) / 2,
+                       kScreenHeight, presentation.screen_widths[1],
+                       kScreenHeight};
+        render_screen(presentation, 0, top_rect);
+        render_screen(presentation, 1, bottom_rect);
+        draw_virtual_controls(renderer, presentation, virtual_controls);
+        if (presentation.single) {
+            // A quiet frame makes the touch inset readable over bright fields.
+            SDL_SetRenderDrawColor(renderer, 230, 230, 230, 255);
+#if defined(NDS_HAVE_SDL3)
+            const SDL_FRect border_f{
+                static_cast<float>(bottom_rect.x - 1),
+                static_cast<float>(bottom_rect.y - 1),
+                static_cast<float>(bottom_rect.w + 2),
+                static_cast<float>(bottom_rect.h + 2)};
+            SDL_RenderRect(renderer, &border_f);
+#else
+            const SDL_Rect border{bottom_rect.x - 1, bottom_rect.y - 1,
+                                  bottom_rect.w + 2, bottom_rect.h + 2};
+            SDL_RenderDrawRect(renderer, &border);
+#endif
+        }
+        if (virtual_stylus_visible)
+            draw_virtual_stylus(renderer, bottom_rect,
+                                virtual_stylus_x, virtual_stylus_y);
+        draw_savestate_notice(renderer, bottom_rect, savestate_notice);
+        ticks.draw += SDL_GetPerformanceCounter() - start;
+        start = SDL_GetPerformanceCounter();
+        // Stacked/single draw both screens into one window, so one request is
+        // satisfied by one readback -- consume it here, otherwise every later
+        // frame would read the backbuffer again.
+        save_frontend_shot(renderer, frame_number, "", take_forced_shot(true));
+        SDL_RenderPresent(renderer);
+        ticks.swap += SDL_GetPerformanceCounter() - start;
+        return ticks;
+    }
+
+    for (int screen = 0; screen < 2; ++screen) {
+        const SDL_Rect screen_rect{
+            0, 0, presentation.screen_widths[screen], kScreenHeight};
+        SDL_Renderer* renderer = presentation.renderers[screen];
+        start = SDL_GetPerformanceCounter();
+        SDL_SetRenderDrawColor(renderer, 20, 20, 20, 255);
+        SDL_RenderClear(renderer);
+        render_screen(presentation, screen, screen_rect);
+        if (screen == 1 && virtual_stylus_visible)
+            draw_virtual_stylus(renderer, screen_rect,
+                                virtual_stylus_x, virtual_stylus_y);
+        if (screen == 1)
+            draw_savestate_notice(renderer, screen_rect, savestate_notice);
+        ticks.draw += SDL_GetPerformanceCounter() - start;
+        start = SDL_GetPerformanceCounter();
+        save_frontend_shot(renderer, frame_number,
+                           screen == 0 ? "-top" : "-bottom",
+                           take_forced_shot(screen == 1));
+        SDL_RenderPresent(renderer);
+        ticks.swap += SDL_GetPerformanceCounter() - start;
+    }
+    return ticks;
+}
+
+} // namespace
+
+void nds_frontend_set_fold_state(int left, int top, int right, int bottom,
+                                 int orientation, bool separating,
+                                 int window_width, int window_height) {
+    int left_permille = 0;
+    int top_permille = 0;
+    int right_permille = 0;
+    int bottom_permille = 0;
+    if (separating && window_width > 0 && window_height > 0) {
+        auto permille = [](int value, int extent) {
+            const long long scaled =
+                static_cast<long long>(value) * 1000 / extent;
+            return static_cast<int>(std::clamp<long long>(scaled, 0, 1000));
+        };
+        left_permille = permille(left, window_width);
+        top_permille = permille(top, window_height);
+        right_permille = permille(right, window_width);
+        bottom_permille = permille(bottom, window_height);
+        if (right_permille <= left_permille ||
+            bottom_permille <= top_permille) {
+            separating = false;
+        }
+    }
+    if (!separating) {
+        left_permille = top_permille = right_permille = bottom_permille = 0;
+        orientation = 0;
+    }
+    g_fold_left_permille.store(left_permille, std::memory_order_relaxed);
+    g_fold_top_permille.store(top_permille, std::memory_order_relaxed);
+    g_fold_right_permille.store(right_permille, std::memory_order_relaxed);
+    g_fold_bottom_permille.store(bottom_permille, std::memory_order_relaxed);
+    g_fold_orientation.store(orientation, std::memory_order_relaxed);
+    g_fold_separating.store(separating, std::memory_order_relaxed);
+    g_fold_serial.fetch_add(1, std::memory_order_release);
+}
+
+int nds_run_interactive_frontend(const NdsFrontendOptions& initial_options) {
+    NdsFrontendOptions options = initial_options;
+    auto audio_env_u32 = [](const char* name, uint32_t fallback,
+                            uint32_t minimum, uint32_t maximum) {
+        const char* value = std::getenv(name);
+        if (!value || !*value) return fallback;
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        if (end == value) return fallback;
+        return static_cast<uint32_t>(
+            std::clamp<unsigned long>(parsed, minimum, maximum));
+    };
+    // Optional low-latency audio tuning. Defaults preserve the validated
+    // 2,048-frame (~63 ms) steady-state buffer and the 57,344-frame boot
+    // prebuffer; a title can lower the startup latency without changing the
+    // scheduler or the emulated SPU.
+    const uint32_t audio_queue_frames =
+        audio_env_u32("NDS_AUDIO_QUEUE_FRAMES", kAudioQueueFrames, 512, 8192);
+    const uint32_t audio_start_frames =
+        audio_env_u32("NDS_AUDIO_START_FRAMES", kAudioStartFrames,
+                      audio_queue_frames, kAudioCapacityFrames);
+    const uint32_t audio_fade_frames =
+        audio_env_u32("NDS_AUDIO_FADE_FRAMES", 0, 0, 4096);
+    SDL_SetMainReady();
+    // SDL_INIT_TIMER matters on Windows: it raises the OS timer resolution
+    // to 1 ms (SDL_HINT_TIMER_RESOLUTION default). Without it SDL_Delay(1)
+    // sleeps a full ~15.6 ms scheduler quantum, so the audio-queue throttle
+    // overshoots every frame, pinning the loop at ~57 FPS and cyclically
+    // starving the audio queue (the audible boot crackle).
+    if (!sdl_init_frontend()) {
+        std::fprintf(stderr, "[sdl] init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+    if (!sdl_set_thread_priority_high())
+        std::fprintf(stderr, "[sdl] thread priority unchanged: %s\n",
+                     SDL_GetError());
+
+#if !defined(NDS_HAVE_SDL3)
+    if (!SDL_SetHintWithPriority(SDL_HINT_RENDER_SCALE_QUALITY, "0",
+                                 SDL_HINT_OVERRIDE)) {
+        std::fprintf(stderr,
+                     "[sdl] render scale quality hint was not applied\n");
+    }
+#endif
+    FrontendPresentation presentation{};
+    if (!create_presentation(options, presentation)) {
+        SDL_Quit();
+        return 1;
+    }
+    const int bottom_logical_width = presentation.separate
+        ? presentation.screen_widths[1]
+        : presentation.canvas_width;
+    const int bottom_content_left =
+        (bottom_logical_width - kScreenWidth) / 2;
+    NdsLogicalRect stacked_top_screen{
+        presentation.separate
+            ? 0
+            : (presentation.canvas_width -
+               presentation.screen_widths[0]) / 2,
+        0, presentation.screen_widths[0], kScreenHeight};
+    NdsLogicalRect stacked_bottom_touch{
+        bottom_content_left,
+        presentation.separate ? 0 : kScreenHeight,
+        kScreenWidth, kScreenHeight};
+    auto reconfigure_single = [&]() {
+        if (!presentation.single) return;
+        int window_width = 0;
+        int window_height = 0;
+        SDL_GetWindowSize(presentation.windows[0], &window_width,
+                          &window_height);
+        if (window_width <= 0 || window_height <= 0) return;
+        bool portrait = window_height > window_width;
+        if (const char* forced = std::getenv("NDS_SINGLE_PORTRAIT")) {
+            portrait = forced[0] == '1';
+        }
+        const bool virtual_strip =
+            options.virtual_controls != NdsVirtualControlsMode::Off;
+        int canvas_width = 0;
+        int canvas_height = 0;
+        SDL_Rect top{};
+        SDL_Rect bottom{};
+        SDL_Rect controls{};
+        bool fold_split = false;
+        bool fold_horizontal = false;
+        constexpr int margin = 8;
+        if (presentation.fold_valid) {
+            const float left = std::clamp(
+                presentation.fold_left * 0.001f, 0.0f, 1.0f);
+            const float top_frac = std::clamp(
+                presentation.fold_top * 0.001f, 0.0f, 1.0f);
+            const float right = std::clamp(
+                presentation.fold_right * 0.001f, 0.0f, 1.0f);
+            const float bottom_frac = std::clamp(
+                presentation.fold_bottom * 0.001f, 0.0f, 1.0f);
+            if (presentation.fold_horizontal) {
+                canvas_height = kFoldCanvasHeight;
+                canvas_width = std::clamp(
+                    static_cast<int>(std::lround(
+                        static_cast<double>(kFoldCanvasHeight) *
+                        window_width / window_height)),
+                    kSingleCanvasWidth, kFoldCanvasMaxWidth);
+                const int hinge_top = std::clamp(
+                    static_cast<int>(std::lround(top_frac * canvas_height)),
+                    0, canvas_height);
+                const int hinge_bottom = std::clamp(
+                    static_cast<int>(
+                        std::lround(bottom_frac * canvas_height)),
+                    hinge_top, canvas_height);
+                const int lower_height = canvas_height - hinge_bottom;
+                if (hinge_top > margin * 2 && lower_height > margin * 2) {
+                    const float top_scale = std::min(
+                        (canvas_width - margin * 2) /
+                            static_cast<float>(presentation.screen_widths[0]),
+                        (hinge_top - margin * 2) /
+                            static_cast<float>(kScreenHeight));
+                    const int controls_width = std::clamp(
+                        static_cast<int>(
+                            std::lround(canvas_width * 0.32f)),
+                        220, 360);
+                    const int available_width =
+                        canvas_width - controls_width - margin * 2;
+                    const float bottom_scale = std::min(
+                        available_width /
+                            static_cast<float>(presentation.screen_widths[1]),
+                        (lower_height - margin * 2) /
+                            static_cast<float>(kScreenHeight));
+                    if (top_scale >= 0.25f && bottom_scale >= 0.25f) {
+                        const int top_w = std::max(
+                            1, static_cast<int>(std::lround(
+                                   presentation.screen_widths[0] *
+                                   top_scale)));
+                        const int top_h = std::max(
+                            1, static_cast<int>(std::lround(
+                                   kScreenHeight * top_scale)));
+                        const int bottom_w = std::max(
+                            1, static_cast<int>(std::lround(
+                                   presentation.screen_widths[1] *
+                                   bottom_scale)));
+                        const int bottom_h = std::max(
+                            1, static_cast<int>(std::lround(
+                                   kScreenHeight * bottom_scale)));
+                        top = SDL_Rect{(canvas_width - top_w) / 2,
+                                       (hinge_top - top_h) / 2,
+                                       top_w, top_h};
+                        bottom = SDL_Rect{
+                            margin + (available_width - bottom_w) / 2,
+                            hinge_bottom + (lower_height - bottom_h) / 2,
+                            bottom_w, bottom_h};
+                        controls = SDL_Rect{canvas_width - controls_width,
+                                            hinge_bottom, controls_width,
+                                            lower_height};
+                        fold_split = true;
+                        fold_horizontal = true;
+                    }
+                }
+            } else {
+                canvas_width = kFoldCanvasHeight;
+                canvas_height = std::clamp(
+                    static_cast<int>(std::lround(
+                        static_cast<double>(kFoldCanvasHeight) *
+                        window_height / window_width)),
+                    kSingleCanvasWidth, kFoldCanvasMaxWidth);
+                const int hinge_left = std::clamp(
+                    static_cast<int>(std::lround(left * canvas_width)),
+                    0, canvas_width);
+                const int hinge_right = std::clamp(
+                    static_cast<int>(std::lround(right * canvas_width)),
+                    hinge_left, canvas_width);
+                const int right_width = canvas_width - hinge_right;
+                if (hinge_left > margin * 2 && right_width > margin * 2) {
+                    const float top_scale = std::min(
+                        (hinge_left - margin * 2) /
+                            static_cast<float>(presentation.screen_widths[0]),
+                        (canvas_height - margin * 2) /
+                            static_cast<float>(kScreenHeight));
+                    const int controls_height = std::clamp(
+                        static_cast<int>(
+                            std::lround(canvas_height * 0.30f)),
+                        180, 360);
+                    const int available_height =
+                        canvas_height - controls_height - margin * 2;
+                    const float bottom_scale = std::min(
+                        (right_width - margin * 2) /
+                            static_cast<float>(presentation.screen_widths[1]),
+                        available_height /
+                            static_cast<float>(kScreenHeight));
+                    if (top_scale >= 0.25f && bottom_scale >= 0.25f) {
+                        const int top_w = std::max(
+                            1, static_cast<int>(std::lround(
+                                   presentation.screen_widths[0] *
+                                   top_scale)));
+                        const int top_h = std::max(
+                            1, static_cast<int>(std::lround(
+                                   kScreenHeight * top_scale)));
+                        const int bottom_w = std::max(
+                            1, static_cast<int>(std::lround(
+                                   presentation.screen_widths[1] *
+                                   bottom_scale)));
+                        const int bottom_h = std::max(
+                            1, static_cast<int>(std::lround(
+                                   kScreenHeight * bottom_scale)));
+                        top = SDL_Rect{(hinge_left - top_w) / 2,
+                                       (canvas_height - top_h) / 2,
+                                       top_w, top_h};
+                        bottom = SDL_Rect{
+                            hinge_right + (right_width - bottom_w) / 2,
+                            margin + (available_height - bottom_h) / 2,
+                            bottom_w, bottom_h};
+                        controls = SDL_Rect{hinge_right,
+                                            canvas_height - controls_height,
+                                            right_width, controls_height};
+                        fold_split = true;
+                        fold_horizontal = false;
+                    }
+                }
+            }
+        }
+        if (!fold_split) {
+            if (portrait) {
+                canvas_width = std::max(
+                    kSinglePortraitWidth,
+                    std::max(presentation.screen_widths[0],
+                             presentation.screen_widths[1]));
+                canvas_height = kScreenHeight * 2 +
+                    (virtual_strip ? kVirtualControlsHeight : 0);
+                top = SDL_Rect{
+                    (canvas_width - presentation.screen_widths[0]) / 2, 0,
+                    presentation.screen_widths[0], kScreenHeight};
+                bottom = SDL_Rect{
+                    (canvas_width - presentation.screen_widths[1]) / 2,
+                    kScreenHeight, presentation.screen_widths[1],
+                    kScreenHeight};
+                controls = SDL_Rect{
+                    0, kScreenHeight * 2, canvas_width,
+                    virtual_strip ? kVirtualControlsHeight : 0};
+            } else {
+                canvas_width = std::max(
+                    kSingleCanvasWidth,
+                    presentation.screen_widths[0] + 32 +
+                        kSingleBottomWidth);
+                canvas_width = std::max(
+                    canvas_width, presentation.screen_widths[1]);
+                canvas_height = kScreenHeight +
+                    (virtual_strip ? kVirtualControlsHeight : 0);
+                top = SDL_Rect{0, 0, presentation.screen_widths[0],
+                               kScreenHeight};
+                bottom = SDL_Rect{canvas_width - kSingleBottomWidth,
+                                  kSingleBottomY, kSingleBottomWidth,
+                                  kSingleBottomHeight};
+                controls = SDL_Rect{0, kScreenHeight, canvas_width,
+                                    virtual_strip
+                                        ? kVirtualControlsHeight : 0};
+            }
+        }
+        presentation.single_portrait = fold_split ? false : portrait;
+        presentation.fold_split = fold_split;
+        presentation.fold_horizontal = fold_horizontal;
+        presentation.canvas_width = canvas_width;
+        presentation.canvas_height = canvas_height;
+        presentation.layout_top = top;
+        presentation.layout_bottom = bottom;
+        presentation.layout_controls = controls;
+        set_render_logical_size(presentation.renderers[0], canvas_width,
+                                canvas_height);
+        stacked_top_screen =
+            NdsLogicalRect{top.x, top.y, top.w, top.h};
+        stacked_bottom_touch =
+            NdsLogicalRect{bottom.x, bottom.y, bottom.w, bottom.h};
+    };
+    reconfigure_single();
+    const int top_content_left = presentation.single
+        ? presentation.layout_top.x
+        : (presentation.separate
+               ? 0
+               : (presentation.canvas_width -
+                  presentation.screen_widths[0]) / 2);
+    std::fprintf(stderr,
+        "[sdl] layout=%s fullscreen=%s adaptive=%s supersampling=%ux aa=%ux "
+        "internal=%ux\n",
+        nds_screen_layout_name(options.screen_layout),
+        nds_fullscreen_mode_name(options.fullscreen),
+        nds_adaptive_screens_name(options.adaptive_screens),
+        static_cast<unsigned>(options.supersampling),
+        static_cast<unsigned>(options.antialiasing),
+        static_cast<unsigned>(options.internal_resolution));
+    const uint16_t output_width = static_cast<uint16_t>(std::max(
+        presentation.screen_widths[0],
+        presentation.screen_widths[1]));
+    if (!nds_gpu3d_set_output_width(output_width)) {
+        std::fprintf(stderr,
+                     "[sdl] adaptive 3D width %u is unavailable\n",
+                     output_width);
+        destroy_presentation(presentation);
+        SDL_Quit();
+        return 1;
+    }
+    // Must precede nds_compute_host_start(): the scale is a baked shader
+    // constant, so it has to be known before the renderer compiles anything.
+    //
+    // Deliberately NOT gated on the direct presenter. Rendering at scale and
+    // presenting at scale are separate: the scaled raster still point-samples
+    // the same native surface every faithful consumer reads, so a run without
+    // the GPU presenter is a valid way to prove that invariance holds. Only
+    // the visible benefit needs gl_top, so that is what the notice says.
+    const uint8_t initial_internal_resolution =
+        options.perf_governor_mode == NdsPerfGovernorMode::ForceStage2
+            ? 1u
+            : options.internal_resolution;
+    if (!nds_gpu3d_set_internal_scale(initial_internal_resolution)) {
+        std::fprintf(stderr,
+                     "[sdl] internal resolution %ux is unavailable\n",
+                     static_cast<unsigned>(initial_internal_resolution));
+        destroy_presentation(presentation);
+        SDL_Quit();
+        return 1;
+    }
+    if (options.internal_resolution > 1 && !presentation.gl_top) {
+        std::fprintf(stderr,
+            "[sdl] internal resolution %ux renders but is not presented: "
+            "the extra sample density needs the direct OpenGL top-screen "
+            "presenter\n",
+            static_cast<unsigned>(options.internal_resolution));
+    }
+    // The adaptive compositor only pays for the extra per-pixel stores when
+    // something can consume them.
+    nds_gpu2d_set_hd_emit(initial_internal_resolution > 1 &&
+                          presentation.gl_top);
+    nds_texture_upscale_set_factor(options.texture_upscale);
+
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+    // Activate only after every fallible visible-frontend allocation. From
+    // here onward teardown always destroys the compute renderer while this
+    // context is current.
+    if (!nds_compute_host_start(
+            presentation.gl_top ? presentation.windows[0] : nullptr)) {
+        destroy_presentation(presentation);
+        SDL_Quit();
+        return 1;
+    }
+    // Auto is allowed to recover from missing/failed GL 4.3. A direct-top
+    // presentation was created without an SDL renderer, so rebuild the same
+    // windows on the faithful SDL/software path after that fallback.
+    if (presentation.gl_top && !nds_compute_host_active()) {
+        destroy_presentation(presentation);
+        presentation = {};
+        if (!create_presentation(options, presentation, false)) {
+            SDL_Quit();
+            return 1;
+        }
+    }
+    nds_gpu2d_set_direct_present(
+        nds_compute_host_has_visible_context());
+#else
+    if (nds_gpu3d_renderer_policy() == NdsGpu3dRendererPolicy::Auto) {
+        std::fprintf(stderr,
+            "[gpu3d] OpenGL renderer not built; "
+            "automatic fallback to threaded soft\n");
+    }
+#endif
+
+    NdsPerfGovernorState perf_governor{};
+    nds_perf_governor_init(&perf_governor,
+                           options.perf_governor_mode);
+    // Governor off is byte-identical to the pre-governor frontend: the scale,
+    // the HD emit flag and the readback latency were all already established
+    // above from the options, so there is nothing to apply and no new way to
+    // fail at startup.
+    if (options.perf_governor_mode != NdsPerfGovernorMode::Off &&
+        !apply_performance_governor_stage(
+            options, presentation, perf_governor.stage)) {
+        destroy_presentation(presentation);
+        SDL_Quit();
+        return 1;
+    }
+
+    // "Frame interpolation (experimental)" — docs/frame_interpolation.md.
+    // Resolved here, after the compute-renderer fallback above, because that
+    // can rebuild the presentation on the SDL path and clear gl_top.
+    //
+    // Diagnostic-only override: NDS_FRAME_INTERPOLATION_MIN_REFRESH=<hz>
+    // lowers the refresh gate so the blend path can be exercised on a 60 Hz
+    // panel during validation. Leave it unset in normal use — a synthetic
+    // present has nowhere to land on a display that is not comfortably above
+    // 60 Hz, and forcing one only spends present time for no visible frame.
+    constexpr int kInterpolationMinRefreshHz = 100;
+    // The audio queue is this frontend's real-time clock, so it is also the
+    // budget for the extra present: a blend happens only while the queue
+    // still holds a comfortable runway (half the steady-state target, ~31 ms).
+    // At or below that the loop is not keeping up and the synthetic present is
+    // skipped for that frame. Nothing in this path ever sleeps or busy-loops.
+    const uint32_t kInterpolationAudioFloorFrames = audio_queue_frames / 2;
+    int interpolation_min_refresh_hz = kInterpolationMinRefreshHz;
+    if (const uint64_t forced_min_refresh =
+            environment_u64("NDS_FRAME_INTERPOLATION_MIN_REFRESH")) {
+        interpolation_min_refresh_hz =
+            static_cast<int>(std::min<uint64_t>(forced_min_refresh, 1000));
+        std::fprintf(stderr,
+            "[sdl] frame interpolation: diagnostic min-refresh override "
+            "%d Hz\n", interpolation_min_refresh_hz);
+    }
+    const bool interpolation_requested =
+        options.frame_interpolation == NdsFrameInterpolation::Blend;
+    bool interpolation_active = false;
+    int interpolation_refresh_hz = 0;
+    if (interpolation_requested) {
+        if (presentation.gl_top) {
+            std::fprintf(stderr,
+                "[sdl] frame interpolation (experimental) is disabled: the "
+                "direct OpenGL top-screen presenter owns its own swap and "
+                "needs an offscreen output texture before a blended frame "
+                "can be inserted\n");
+        } else {
+            interpolation_refresh_hz =
+                window_refresh_hz(presentation.windows[0]);
+            if (interpolation_refresh_hz <= 0) {
+                interpolation_refresh_hz = 0;
+                std::fprintf(stderr,
+                    "[sdl] frame interpolation: display refresh unavailable "
+                    "(%s)\n", SDL_GetError());
+            }
+            interpolation_active =
+                interpolation_refresh_hz >= interpolation_min_refresh_hz;
+            std::fprintf(stderr,
+                "[sdl] frame interpolation (experimental): mode=blend "
+                "active=%s refresh=%dHz min_refresh=%dHz\n",
+                interpolation_active ? "yes" : "no",
+                interpolation_refresh_hz, interpolation_min_refresh_hz);
+        }
+    }
+
+    AudioQueue audio_queue{};
+    VirtualControlsState virtual_controls{};
+    SDL_AudioSpec want{};
+    // The mixer runs once per 1024 DS system cycles. Request its integer host
+    // rate directly; the sub-sample remainder is absorbed by the bounded queue
+    // instead of producing a roughly once-per-second underrun at 32768 Hz.
+    want.freq = kAudioFrequency;
+    want.format = AUDIO_S16SYS;
+    want.channels = 2;
+#if !defined(NDS_HAVE_SDL3)
+    want.samples = 1024;
+    want.callback = audio_callback;
+    want.userdata = &audio_queue;
+#endif
+    NdsAudioDevice audio = open_audio_device(audio_queue, want);
+    if (!audio)
+        std::fprintf(stderr, "[sdl] audio unavailable: %s\n", SDL_GetError());
+
+    std::fprintf(stderr,
+        "[sdl] controls: gamepad=Player 1 | bottom mouse=touch | "
+        "arrows=D-pad | Z=A X=B | A=Y S=X | Q=L W=R | "
+        "Enter=Start Backspace=Select | Esc=settings | "
+        "hold Left Shift=fast forward%s\n",
+        options.tab_turbo ? " | hold Tab=turbo" : "");
+    if (options.relative_mouse_touch) {
+        std::fprintf(stderr,
+            "[sdl] relative mouse: click game screen to capture; "
+            "Esc or focus loss releases; sensitivity=%u%% invert-y=%s "
+            "aim=%s\n",
+            static_cast<unsigned>(options.relative_mouse_sensitivity),
+            options.relative_mouse_invert_y ? "on" : "off",
+            options.relative_mouse_direct_aim ? "direct-unbounded"
+                                              : "virtual-touch");
+    }
+    const bool mph_prime_controls_available =
+        options.mph_prime_controls && options.relative_mouse_direct_aim;
+    const bool mph_prime_unified_window_focus =
+        mph_prime_controls_available &&
+        options.mph_prime_unified_window_focus;
+    const bool virtual_stylus_available =
+        options.virtual_stylus.enabled && !mph_prime_controls_available;
+    MphPrimeBindingSet mph_prime_bindings{};
+    MphPadBindingSet mph_pad_bindings{};
+    if (mph_prime_controls_available) {
+        mph_prime_bindings = make_mph_prime_bindings(options.mph_bindings);
+        mph_pad_bindings = make_mph_pad_bindings(options.mph_pad_bindings);
+        if (!mph_prime_bindings.valid || !mph_pad_bindings.valid) {
+            destroy_presentation(presentation);
+            SDL_Quit();
+            return 1;
+        }
+        std::fprintf(stderr,
+            "[sdl] MPH Prime Controls: melonPrimeDS bindings enabled; "
+            "virtual stylus sensitivity=%u%%\n",
+            static_cast<unsigned>(
+                options.mph_virtual_stylus_sensitivity));
+    }
+    MphPrimeBinding virtual_stylus_binding =
+        parse_mph_prime_binding(options.virtual_stylus.binding);
+    MphPrimeBinding virtual_stylus_tap_binding =
+        parse_mph_prime_binding(options.virtual_stylus.tap_binding);
+    bool virtual_stylus_hold_recognized = true;
+    bool virtual_stylus_tap_recognized = true;
+    MphPadBinding virtual_stylus_pad_hold =
+        parse_mph_pad_binding(options.virtual_stylus.pad_hold_binding,
+                              &virtual_stylus_hold_recognized);
+    MphPadBinding virtual_stylus_pad_tap =
+        parse_mph_pad_binding(options.virtual_stylus.pad_tap_binding,
+                              &virtual_stylus_tap_recognized);
+    if (virtual_stylus_available &&
+        ((virtual_stylus_binding.kind == MphPrimeInputKind::None &&
+          binding_name_lower(options.virtual_stylus.binding) != "none" &&
+          binding_name_lower(options.virtual_stylus.binding) != "unbound") ||
+         (virtual_stylus_tap_binding.kind == MphPrimeInputKind::None &&
+          binding_name_lower(options.virtual_stylus.tap_binding) != "none" &&
+          binding_name_lower(options.virtual_stylus.tap_binding) != "unbound") ||
+         !virtual_stylus_hold_recognized ||
+         !virtual_stylus_tap_recognized)) {
+        std::fprintf(stderr,
+            "[sdl] invalid Virtual Stylus binding "
+            "(key=%s tap=%s pad_hold=%s pad_tap=%s)\n",
+            options.virtual_stylus.binding.c_str(),
+            options.virtual_stylus.tap_binding.c_str(),
+            options.virtual_stylus.pad_hold_binding.c_str(),
+            options.virtual_stylus.pad_tap_binding.c_str());
+        destroy_presentation(presentation);
+        SDL_Quit();
+        return 1;
+    }
+    if (virtual_stylus_available) {
+        std::fprintf(stderr,
+            "[sdl] Virtual Stylus: hold %s or %s; tap %s/%s or mouse left; "
+            "sensitivity=%u%% pad=%u%%\n",
+            options.virtual_stylus.binding.c_str(),
+            options.virtual_stylus.pad_hold_binding.c_str(),
+            options.virtual_stylus.tap_binding.c_str(),
+            options.virtual_stylus.pad_tap_binding.c_str(),
+            static_cast<unsigned>(options.virtual_stylus.sensitivity),
+            static_cast<unsigned>(options.virtual_stylus.pad_sensitivity));
+    }
+
+    SDL_GameController* controller = open_first_controller();
+    SDL_JoystickID controller_id = controller
+        ? sdl_controller_id(controller)
+        : -1;
+    uint16_t keyboard_pressed = 0;
+    uint16_t controller_pressed = 0;
+    uint16_t mouse_pressed = 0;
+    uint16_t mph_prime_pressed = 0;
+    uint16_t scripted_pressed = 0;
+    uint16_t virtual_controls_pressed = 0;
+    // Left analog stick mapped to the D-pad (movement in MPH, menus
+    // everywhere), kept separate from button-event state so a wobbling
+    // stick never fights explicit D-pad presses.
+    uint16_t stick_pressed = 0;
+    auto publish_keys = [&]() {
+        nds_set_key_mask(static_cast<uint16_t>(
+            0x0FFFu &
+            ~(keyboard_pressed | controller_pressed | mouse_pressed |
+              mph_prime_pressed | stick_pressed | scripted_pressed |
+              virtual_controls_pressed)));
+    };
+    publish_keys();
+    nds_set_touch(0, 0, false);
+    bool running = true;
+    // Built below, once every effect it can trigger (presentation, audio,
+    // savestate slots) has been established. Declared here because the input
+    // helpers above it have to be able to ask whether it is open.
+    RecompRuntimeUi* runtime_ui = nullptr;
+    RuntimeMenuState runtime_menu_state{};
+    RecompRuntimeRestore runtime_restore{};
+    runtime_menu_state.options = &options;
+    runtime_menu_state.running = &running;
+    load_runtime_settings(options.runtime_settings_path,
+                          runtime_menu_state.settings, &runtime_restore);
+    if (runtime_restore.mouse) {
+        // Mouse sensitivity has no live hook: it is read straight out of
+        // `options` wherever the pointer is captured, so restoring it is just a
+        // field write and it must happen before the first capture.
+        options.relative_mouse_sensitivity =
+            static_cast<uint16_t>(runtime_menu_state.settings.mouse_sensitivity);
+    }
+    bool menu_pauses_game = runtime_menu_state.settings.pause_in_menu != 0;
+    bool menu_paused_previous = false;
+    bool compute_failed = false;
+    bool mouse_down = false;
+    bool touch_release_pending = false;
+    uint32_t touch_frames_held = 0;
+    int64_t relative_delta_x = 0;
+    int64_t relative_delta_y = 0;
+    uint64_t relative_direct_writes = 0;
+    uint64_t mph_prime_key_downs = 0;
+    uint64_t mph_prime_mouse_downs = 0;
+    NdsRelativeMouseTouch relative_mouse;
+    std::array<bool, static_cast<size_t>(MphPrimeAction::Count)>
+        mph_prime_held{};
+    MphTouchSequence mph_touch_sequence{};
+    float mph_virtual_x = 128.0f;
+    float mph_virtual_y = 96.0f;
+    // ── Gamepad dual-stick state ──────────────────────────────────────────
+    // Right stick + triggers drive Prime Controls camera aim and fire,
+    // engaging while used and idling back out so the touchscreen and menus
+    // keep working when the sticks rest.
+    bool mph_prime_pad_engaged = false;
+    bool virtual_stylus_pointer_held = false;
+    bool virtual_stylus_pad_held = false;
+    bool virtual_stylus_tap_held = false;
+    bool virtual_stylus_capture_owned = false;
+    float virtual_stylus_pad_rem_x = 0.0f;
+    float virtual_stylus_pad_rem_y = 0.0f;
+    bool virtual_stylus_pad_trigger_left_held = false;
+    bool virtual_stylus_pad_trigger_right_held = false;
+    int mph_pad_idle_frames = 0;
+    float mph_pad_aim_rem_x = 0.0f;
+    float mph_pad_aim_rem_y = 0.0f;
+    int32_t mph_pad_frame_x = 0;
+    int32_t mph_pad_frame_y = 0;
+    bool mph_pad_trigger_left_held = false;
+    bool mph_pad_trigger_right_held = false;
+    uint64_t mph_pad_aim_writes = 0;
+    bool runtime_stick_held = false;
+    RecompRuntimeUiInput runtime_stick_input =
+        RECOMP_RUNTIME_UI_INPUT_DOWN;
+    uint32_t runtime_stick_frames = 0;
+    auto mph_prime_active = [&]() {
+        return mph_prime_controls_available &&
+               (relative_mouse.captured() || mph_prime_pad_engaged);
+    };
+    auto virtual_stylus_active = [&]() {
+        return virtual_stylus_available &&
+               (virtual_stylus_pointer_held || virtual_stylus_pad_held);
+    };
+    auto update_mph_prime_pressed = [&]() {
+        uint16_t mask = 0;
+        const bool virtual_stylus =
+            mph_prime_held[static_cast<size_t>(
+                MphPrimeAction::VirtualStylus)];
+        for (size_t i = 0; i < mph_prime_held.size(); ++i) {
+            if (!mph_prime_held[i]) continue;
+            const auto action = static_cast<MphPrimeAction>(i);
+            if (virtual_stylus &&
+                (action == MphPrimeAction::Shoot ||
+                 action == MphPrimeAction::ScanShoot)) {
+                continue;
+            }
+            mask |= mph_prime_hold_mask(action);
+        }
+        mph_prime_pressed = mask;
+        publish_keys();
+    };
+    auto clear_mph_prime_controls = [&]() {
+        mph_prime_held.fill(false);
+        mph_prime_pressed = 0;
+        mph_touch_sequence = {};
+    };
+    auto is_presentation_window = [&](uint32_t window_id) {
+        return window_id == presentation.window_ids[0] ||
+               window_id == presentation.window_ids[1];
+    };
+    auto presentation_window_focus_index = [&](uint32_t window_id) {
+        if (window_id == presentation.window_ids[0]) return 0;
+        if (presentation.separate &&
+            window_id == presentation.window_ids[1]) {
+            return 1;
+        }
+        return -1;
+    };
+    auto set_mph_prime_action = [&](MphPrimeAction action, bool down,
+                                    bool repeat) {
+        const size_t index = static_cast<size_t>(action);
+        const uint16_t mask = mph_prime_hold_mask(action);
+        if (mask != 0 ||
+            action == MphPrimeAction::VirtualStylus) {
+            mph_prime_held[index] = down;
+            update_mph_prime_pressed();
+            return true;
+        }
+        if (down && !repeat)
+            start_mph_touch_action(action, mph_touch_sequence);
+        return true;
+    };
+    auto process_mph_prime_key = [&](SDL_Scancode key, bool down,
+                                     bool repeat) {
+        if (!mph_prime_controls_available) return false;
+        bool consumed = false;
+        for (size_t i = 0; i < mph_prime_bindings.bindings.size(); ++i) {
+            if (!binding_matches_key(mph_prime_bindings.bindings[i], key))
+                continue;
+            consumed = true;
+            set_mph_prime_action(static_cast<MphPrimeAction>(i), down,
+                                 repeat);
+        }
+        if (consumed && down && !repeat)
+            ++mph_prime_key_downs;
+        return consumed;
+    };
+    // Pad buttons bound to Prime actions are consumed here (never also sent
+    // as raw DS buttons). Unlike the keyboard path this gates on
+    // availability, not on active capture: pressing a bound button is
+    // itself the pad's engage gesture.
+    auto process_mph_prime_pad = [&](MphPadInputKind kind,
+                                     SDL_GameControllerButton button,
+                                     bool down) {
+        if (!mph_prime_controls_available) return false;
+        bool consumed = false;
+        for (size_t i = 0; i < mph_pad_bindings.bindings.size(); ++i) {
+            const MphPadBinding& binding = mph_pad_bindings.bindings[i];
+            if (binding.kind != kind) continue;
+            if (kind == MphPadInputKind::Button &&
+                binding.button != button) {
+                continue;
+            }
+            consumed = true;
+            if (down) {
+                mph_prime_pad_engaged = true;
+                mph_pad_idle_frames = 0;
+            }
+            set_mph_prime_action(static_cast<MphPrimeAction>(i), down,
+                                 false);
+        }
+        return consumed;
+    };
+    auto process_mph_prime_mouse = [&](uint8_t button, bool down,
+                                       bool repeat) {
+        if (!mph_prime_active()) return false;
+        bool consumed = false;
+        for (size_t i = 0; i < mph_prime_bindings.bindings.size(); ++i) {
+            if (!binding_matches_mouse(mph_prime_bindings.bindings[i],
+                                       button)) {
+                continue;
+            }
+            consumed = true;
+            set_mph_prime_action(static_cast<MphPrimeAction>(i), down,
+                                 repeat);
+        }
+        if (consumed && down && !repeat)
+            ++mph_prime_mouse_downs;
+        return consumed;
+    };
+    auto release_virtual_stylus_capture = [&]() {
+        if (!virtual_stylus_capture_owned) return;
+        if (!relative_mouse.captured()) {
+            sdl_set_relative_mouse_mode(presentation.windows[0], false);
+            SDL_CaptureMouse(SDL_FALSE);
+        }
+        virtual_stylus_capture_owned = false;
+    };
+    auto clear_virtual_stylus = [&]() {
+        virtual_stylus_pointer_held = false;
+        virtual_stylus_pad_held = false;
+        virtual_stylus_tap_held = false;
+        virtual_stylus_pad_rem_x = 0.0f;
+        virtual_stylus_pad_rem_y = 0.0f;
+        nds_set_touch(0, 0, false);
+        release_virtual_stylus_capture();
+    };
+    auto capture_virtual_stylus_mouse = [&]() {
+        if (!virtual_stylus_available || virtual_stylus_capture_owned ||
+            relative_mouse.captured()) {
+            return;
+        }
+        if (!sdl_set_relative_mouse_mode(presentation.windows[0], true)) {
+            std::fprintf(stderr,
+                         "[sdl] Virtual Stylus capture failed: %s\n",
+                         SDL_GetError());
+            return;
+        }
+        SDL_CaptureMouse(SDL_TRUE);
+        SDL_GetRelativeMouseState(nullptr, nullptr);
+        virtual_stylus_capture_owned = true;
+    };
+    auto set_virtual_stylus_pointer_hold = [&](bool down) {
+        if (!virtual_stylus_available) return false;
+        virtual_stylus_pointer_held = down;
+        if (down)
+            capture_virtual_stylus_mouse();
+        else if (!virtual_stylus_pad_held) {
+            virtual_stylus_tap_held = false;
+            release_virtual_stylus_capture();
+            nds_set_touch(0, 0, false);
+        }
+        return true;
+    };
+    auto set_virtual_stylus_pad_hold = [&](bool down) {
+        if (!virtual_stylus_available) return false;
+        virtual_stylus_pad_held = down;
+        if (!down && !virtual_stylus_pointer_held) {
+            virtual_stylus_tap_held = false;
+            nds_set_touch(0, 0, false);
+        }
+        return true;
+    };
+    auto process_virtual_stylus_key = [&](SDL_Scancode key, bool down) {
+        if (binding_matches_key(virtual_stylus_binding, key))
+            return set_virtual_stylus_pointer_hold(down);
+        if (binding_matches_key(virtual_stylus_tap_binding, key)) {
+            if (down) {
+                if (!virtual_stylus_active()) return true;
+                virtual_stylus_tap_held = true;
+            } else {
+                virtual_stylus_tap_held = false;
+            }
+            return true;
+        }
+        return false;
+    };
+    auto process_virtual_stylus_mouse_hold = [&](uint8_t button, bool down) {
+        return binding_matches_mouse(virtual_stylus_binding, button) &&
+               set_virtual_stylus_pointer_hold(down);
+    };
+    auto process_virtual_stylus_mouse_tap = [&](uint8_t button, bool down) {
+        if (!binding_matches_mouse(virtual_stylus_tap_binding, button))
+            return false;
+        if (down) {
+            if (!virtual_stylus_active()) return true;
+            virtual_stylus_tap_held = true;
+        } else {
+            virtual_stylus_tap_held = false;
+        }
+        return true;
+    };
+    auto process_virtual_stylus_pad = [&](MphPadInputKind kind,
+                                          SDL_GameControllerButton button,
+                                          bool down) {
+        if (pad_binding_matches(virtual_stylus_pad_hold, kind, button))
+            return set_virtual_stylus_pad_hold(down);
+        if (virtual_stylus_active() &&
+            pad_binding_matches(virtual_stylus_pad_tap, kind, button)) {
+            virtual_stylus_tap_held = down;
+            return true;
+        }
+        return false;
+    };
+    auto release_relative_mouse = [&]() {
+        if (relative_mouse.captured()) {
+            sdl_set_relative_mouse_mode(presentation.windows[0], false);
+            SDL_CaptureMouse(SDL_FALSE);
+            relative_mouse.release();
+            nds_set_touch(0, 0, false);
+            std::fprintf(stderr, "[sdl] relative mouse released\n");
+        }
+        if (mouse_pressed != 0) {
+            mouse_pressed = 0;
+            publish_keys();
+        }
+        clear_mph_prime_controls();
+        clear_virtual_stylus();
+        publish_keys();
+        relative_delta_x = 0;
+        relative_delta_y = 0;
+    };
+    auto capture_relative_mouse = [&]() {
+        if (!options.relative_mouse_touch || relative_mouse.captured())
+            return;
+        if (!sdl_set_relative_mouse_mode(presentation.windows[0], true)) {
+            std::fprintf(stderr,
+                         "[sdl] relative mouse capture failed: %s\n",
+                         SDL_GetError());
+            return;
+        }
+        SDL_CaptureMouse(SDL_TRUE);
+        SDL_GetRelativeMouseState(nullptr, nullptr);
+        relative_mouse.capture(options.relative_mouse_sensitivity,
+                               options.relative_mouse_invert_y);
+        if (mph_prime_controls_available && keyboard_pressed != 0) {
+            keyboard_pressed = 0;
+            publish_keys();
+        }
+        nds_set_touch(relative_mouse.x(), relative_mouse.y(), true);
+        std::fprintf(stderr, "[sdl] relative mouse captured\n");
+    };
+    uint64_t shown_frames = 0;
+    uint64_t last_fold_serial = 0;
+    uint64_t synthetic_presents = 0;
+    FrameBlendCache blend_cache{};
+    uint64_t fps_frames = 0;
+    uint64_t fps_start = SDL_GetPerformanceCounter();
+    const uint64_t frequency = SDL_GetPerformanceFrequency();
+    const uint64_t soak_frames = environment_u64("NDS_FRONTEND_MAX_FRAMES");
+    const bool print_stats = std::getenv("NDS_FRONTEND_STATS") != nullptr;
+    const bool require_audio =
+        std::getenv("NDS_FRONTEND_REQUIRE_AUDIO") != nullptr;
+    const bool selftest_menu =
+        std::getenv("NDS_FRONTEND_SELFTEST_MENU") != nullptr;
+    const bool selftest_relative_mouse =
+        std::getenv("NDS_FRONTEND_SELFTEST_RELATIVE_MOUSE") != nullptr;
+    const uint64_t relative_mouse_selftest_start_vblank =
+        environment_u64("NDS_FRONTEND_SELFTEST_RELATIVE_MOUSE_VBLANK");
+    bool audio_started = false;
+    uint32_t audio_start_threshold = audio_start_frames;
+    uint32_t audio_fade_remaining = 0;
+    bool audio_queue_error = false;
+    uint64_t audio_presentation_epoch = nds_spu_presentation_epoch();
+    bool turbo_pressed = false;
+    bool turbo_active = false;
+    bool fast_forward_pressed = false;
+    bool fast_forward_active = false;
+    int fast_forward_ratio = 0;
+    bool focus_release_pending = false;
+    bool presentation_window_focused[2] = {
+        (SDL_GetWindowFlags(presentation.windows[0]) &
+         SDL_WINDOW_INPUT_FOCUS) != 0,
+        presentation.separate &&
+            (SDL_GetWindowFlags(presentation.windows[1]) &
+             SDL_WINDOW_INPUT_FOCUS) != 0,
+    };
+    auto any_presentation_window_focused = [&]() {
+        return presentation_window_focused[0] ||
+               (presentation.separate && presentation_window_focused[1]);
+    };
+    auto clear_tab_turbo = [&]() {
+        if (options.tab_turbo) turbo_pressed = false;
+    };
+    // Fast forward rides the same "the machine must not be starved" rule as
+    // turbo, so its release path is identical: drop the held state and let the
+    // frame loop re-anchor and republish on the next iteration.
+    auto clear_fast_forward = [&]() {
+        fast_forward_pressed = false;
+    };
+    auto runtime_menu_open = [&]() {
+        return runtime_ui && recomp_runtime_ui_is_open(runtime_ui);
+    };
+    auto clear_gameplay_input_for_runtime_menu = [&]() {
+        release_relative_mouse();
+        keyboard_pressed = 0;
+        controller_pressed = 0;
+        stick_pressed = 0;
+        mouse_pressed = 0;
+        mph_prime_pressed = 0;
+        mph_prime_pad_engaged = false;
+        mph_pad_trigger_left_held = false;
+        mph_pad_trigger_right_held = false;
+        virtual_stylus_pad_trigger_left_held = false;
+        virtual_stylus_pad_trigger_right_held = false;
+        turbo_pressed = false;
+        fast_forward_pressed = false;
+        clear_mph_prime_controls();
+        clear_virtual_stylus();
+        nds_set_touch(0, 0, false);
+        publish_keys();
+    };
+    auto finish_runtime_menu_input = [&](bool was_open) {
+        if (runtime_menu_state.close_requested) {
+            runtime_menu_state.close_requested = false;
+            if (runtime_ui) recomp_runtime_ui_close(runtime_ui);
+        }
+        if (!was_open && runtime_menu_open())
+            clear_gameplay_input_for_runtime_menu();
+    };
+    uint32_t audio_pace_floor = audio_queue_frames;
+    uint32_t audio_min_queue = std::numeric_limits<uint32_t>::max();
+    uint32_t audio_max_queue = 0;
+    uint64_t host_key_presses = 0;
+    uint64_t host_touch_presses = 0;
+    int last_touch_event_x = -1;
+    int last_touch_event_y = -1;
+    bool selftest_key_down = false;
+    bool selftest_key_up = false;
+    bool selftest_touch_down = false;
+    bool selftest_touch_up = false;
+    bool selftest_event_error = false;
+    unsigned relative_mouse_selftest_stage = 0;
+    bool relative_mouse_selftest_error = false;
+    uint64_t phase_emu_ticks = 0;
+    uint64_t phase_present_ticks = 0;
+    uint64_t phase_adaptive_ticks = 0;
+    uint64_t phase_upload_ticks = 0;
+    uint64_t phase_draw_ticks = 0;
+    uint64_t phase_swap_ticks = 0;
+    uint64_t phase_drain_ticks = 0;
+    uint64_t governor_last_underruns = 0;
+    NdsGpu3dProfile governor_gpu3d_profile{};
+    nds_gpu3d_profile(&governor_gpu3d_profile);
+    uint64_t governor_last_compute_map_ns =
+        governor_gpu3d_profile.compute_readback_ns;
+    g_live_stats = {};
+    g_live_stats.active = 1;
+    g_live_stats.freq = frequency;
+    g_black_band = {};
+    g_input_debug = {};
+    nds_diagnostics_start_performance_log(options);
+    nds_perf_governor_history_reset();
+    if (perf_governor.stage != 0u) {
+        nds_perf_governor_record_transition(
+            0, perf_governor.stage, NdsPerfGovernorReason::Initial, 0,
+            false, false);
+        nds_diagnostics_note_perf_governor_transition(
+            0, perf_governor.stage, "initial");
+    }
+    auto publish_input_debug = [&]() {
+        g_input_debug.active = 1;
+        g_input_debug.mph_prime_controls_available =
+            mph_prime_controls_available ? 1 : 0;
+        g_input_debug.mph_prime_controls_active =
+            mph_prime_active() ? 1 : 0;
+        g_input_debug.virtual_stylus_available =
+            virtual_stylus_available ? 1 : 0;
+        g_input_debug.virtual_stylus_active =
+            virtual_stylus_active() ? 1 : 0;
+        g_input_debug.virtual_stylus_tap_held =
+            virtual_stylus_tap_held ? 1 : 0;
+        g_input_debug.relative_mouse_captured =
+            relative_mouse.captured() ? 1 : 0;
+        g_input_debug.keyboard_pressed = keyboard_pressed;
+        g_input_debug.mouse_pressed = mouse_pressed;
+        g_input_debug.mph_prime_pressed = mph_prime_pressed;
+        g_input_debug.stick_pressed = stick_pressed;
+        g_input_debug.pad_engaged = mph_prime_pad_engaged ? 1 : 0;
+        g_input_debug.pad_aim_writes = mph_pad_aim_writes;
+        g_input_debug.published_key_mask = static_cast<uint16_t>(
+            0x0FFFu & ~(keyboard_pressed | controller_pressed |
+                        mouse_pressed | mph_prime_pressed |
+                        stick_pressed | scripted_pressed |
+                        virtual_controls_pressed));
+        g_input_debug.relative_direct_writes = relative_direct_writes;
+        g_input_debug.mph_prime_key_downs = mph_prime_key_downs;
+        g_input_debug.mph_prime_mouse_downs = mph_prime_mouse_downs;
+        g_input_debug.virtual_stylus_x =
+            static_cast<int>(std::lround(mph_virtual_x));
+        g_input_debug.virtual_stylus_y =
+            static_cast<int>(std::lround(mph_virtual_y));
+        g_input_debug.top_window_id = presentation.window_ids[0];
+        g_input_debug.bottom_window_id = presentation.window_ids[1];
+        g_input_debug.bottom_content_left = bottom_content_left;
+        g_input_debug.separate = presentation.separate ? 1 : 0;
+    };
+    publish_input_debug();
+    uint64_t max_emu_ticks = 0;
+    uint64_t max_emu_frame = 0;
+    uint64_t slow_frames_32ms = 0;
+    uint64_t last_underruns_seen = 0;
+    uint64_t first_underrun_frame = 0;
+    uint64_t last_underrun_frame = 0;
+    const uint64_t soak_start = SDL_GetPerformanceCounter();
+    std::string savestate_notice;
+    uint64_t savestate_notice_until = 0;
+
+    // ── Runtime settings menu ────────────────────────────────────────────
+    // The standard builder supplies the shared cross-ecosystem settings
+    // surface; the callbacks above are what makes its rows act on this host.
+    // Capability is decided against what the interactive loop can actually
+    // change live: screen layout, view mode and adaptive widescreen all need a
+    // rebuilt presentation, so they are not offered rather than offered dead.
+    // The image filter is an extra row, not the standard TEXTURE_FILTER row,
+    // because this host's honest vocabulary is "nearest/linear" (the SDL
+    // sampler) and the standard row would advertise shader filters it does not
+    // have.
+    static const char* const kFilterChoices[] = {"Nearest", "Linear"};
+    // The two picture effects the presenter owns. They are extra rows rather
+    // than the shared standard menu's "Color correction" / "LCD ghosting" bits,
+    // because those name different effects (a fixed correction, and a
+    // persistence trail): a row whose label lies about what it does is worse
+    // than one that is absent.
+    static const char* const kColorModeChoices[] = {
+        "Original", "Light", "Moderate", "Strong"};
+    static const int kColorModeValues[] = {
+        nds_display_filter::kColorModeOriginal,
+        nds_display_filter::kColorModeLight,
+        nds_display_filter::kColorModeModerate,
+        nds_display_filter::kColorModeStrong,
+    };
+    static const RecompRuntimeUiItem runtime_menu_extra_items[] = {
+        {kRuntimeMouseSensitivityKey, "Input", "Mouse sensitivity",
+         "Prime Controls relative aim speed.",
+         RECOMP_RUNTIME_UI_INT, 10, 400, 1, nullptr, 0, nullptr},
+        {RECOMP_RUNTIME_UI_KEY_TEXTURE_FILTER, "Graphics", "Image filter",
+         "Nearest keeps pixels sharp; linear smooths them.",
+         RECOMP_RUNTIME_UI_CHOICE, 0, 1, 1, kFilterChoices, 2, nullptr},
+        {kRuntimeColorModeKey, "Graphics", "Color mode",
+         "Warm the palette the way the DS colour-reproduction setting does.",
+         RECOMP_RUNTIME_UI_CHOICE, 0,
+         nds_display_filter::kColorModeCount - 1, 1, kColorModeChoices,
+         sizeof(kColorModeChoices) / sizeof(kColorModeChoices[0]),
+         kColorModeValues},
+        {kRuntimeLcdGridKey, "Graphics", "LCD grid",
+         "Dim one pixel in two to imitate the original panel.",
+         RECOMP_RUNTIME_UI_BOOL, 0, 1, 1, nullptr, 0, nullptr},
+        {kRuntimeFastForwardKey, "System", "Fast forward",
+         "Hold left shift to run at this multiple. 0 disables it.",
+         RECOMP_RUNTIME_UI_INT, 0, kRuntimeFastForwardMax, 1, nullptr, 0,
+         nullptr},
+    };
+    RecompRuntimeUiStandardConfig standard_config{};
+    standard_config.menu.title = "Digimon Story Sunburst";
+    standard_config.menu.subtitle = "Settings";
+    standard_config.menu.theme = "nds";
+    standard_config.menu.accept_label = "A / Enter";
+    standard_config.menu.back_label = "B / Backspace";
+    standard_config.menu.callbacks.context = &runtime_menu_state;
+    standard_config.menu.callbacks.get_value = runtime_menu_get_value;
+    standard_config.menu.callbacks.set_value = runtime_menu_set_value;
+    standard_config.menu.callbacks.run_action = runtime_menu_run_action;
+    standard_config.menu.callbacks.is_enabled = runtime_menu_is_enabled;
+    standard_config.menu.callbacks.save = runtime_menu_save;
+    standard_config.features =
+        RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN |
+        RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE |
+        RECOMP_RUNTIME_UI_STANDARD_INTEGER_SCALE |
+        RECOMP_RUNTIME_UI_STANDARD_RESOLUTION_SCALE |
+        RECOMP_RUNTIME_UI_STANDARD_MENU_BACKDROP |
+        RECOMP_RUNTIME_UI_STANDARD_AUDIO |
+        RECOMP_RUNTIME_UI_STANDARD_VOLUME |
+        RECOMP_RUNTIME_UI_STANDARD_STATE_SLOT |
+        RECOMP_RUNTIME_UI_STANDARD_SAVE_STATE |
+        RECOMP_RUNTIME_UI_STANDARD_LOAD_STATE |
+        RECOMP_RUNTIME_UI_STANDARD_PAUSE_IN_MENU |
+        RECOMP_RUNTIME_UI_STANDARD_RESUME |
+        RECOMP_RUNTIME_UI_STANDARD_QUIT;
+    standard_config.window_scale_max = kRuntimeWindowScaleMax;
+    standard_config.resolution_scale_max = kRuntimeResolutionScaleMax;
+    standard_config.state_slot_count =
+        static_cast<int>(NDS_SAVESTATE_SLOT_COUNT);
+    standard_config.extra_items = runtime_menu_extra_items;
+    standard_config.extra_item_count =
+        sizeof(runtime_menu_extra_items) / sizeof(runtime_menu_extra_items[0]);
+    runtime_ui = recomp_runtime_ui_create_standard(&standard_config);
+    if (runtime_ui) {
+        recomp_runtime_ui_set_backdrop(
+            runtime_ui,
+            static_cast<float>(runtime_menu_state.settings.menu_dim) / 100.0f,
+            static_cast<float>(runtime_menu_state.settings.menu_opacity) /
+                100.0f);
+        std::fprintf(stderr, "[sdl] runtime settings menu ready\n");
+    } else {
+        std::fprintf(stderr, "[sdl] runtime menu unavailable\n");
+    }
+
+    // One save/load path, used by both the F-key shortcuts and the menu rows.
+    // A load has to re-prime more than the guest: the governor stage, the blend
+    // cache, the digest epoch and the live input registers all describe a
+    // machine that no longer exists, so they are re-established here rather
+    // than at each call site.
+    auto execute_savestate_command = [&](NdsSavestateSlotCommand command) {
+        const NdsSavestateSlotResult result = nds_savestate_slot_execute(
+            options.savestate_directory,
+            {options.savestate_build_id, options.savestate_rom_sha1},
+            command);
+        savestate_notice = result.message;
+        savestate_notice_until = SDL_GetPerformanceCounter() + frequency * 4u;
+        std::fprintf(stderr, "[savestate] %s\n", result.message.c_str());
+        // Same instant into the perf log. stderr is not in a field bundle and
+        // carries no timestamp; a load re-primes every diagnostic baseline, so
+        // a bundle that cannot see where the loads were reads the re-priming as
+        // a performance event.
+        nds_diagnostics_note_savestate(
+            command.action == NdsSavestateSlotAction::Save ? "save" : "load",
+            command.slot, result.success);
+        if (!result.success || command.action != NdsSavestateSlotAction::Load)
+            return result;
+        // gpu3d_savestate_import() clears the readback-latency flag as part of
+        // installing a fresh renderer, so the live stage has to be
+        // re-established. Skipped once the governor is terminally disabled: the
+        // installed state is then whatever survived the failure.
+        if (!perf_governor.apply_failed &&
+            options.perf_governor_mode != NdsPerfGovernorMode::Off &&
+            !apply_performance_governor_stage(
+                options, presentation, perf_governor.stage)) {
+            nds_perf_governor_mark_apply_failed(&perf_governor);
+            nds_perf_governor_record_transition(
+                perf_governor.stage, perf_governor.stage,
+                NdsPerfGovernorReason::ApplyFailed, shown_frames,
+                perf_governor.stage2_held, true);
+            nds_diagnostics_note_perf_governor_transition(
+                perf_governor.stage, perf_governor.stage, "apply_failed");
+        }
+        blend_cache.valid = false;
+        // A load re-primes the machine, so it also opens a new digest epoch: it
+        // is the only alignment point two independently launched processes
+        // share, since shown_frames at load time is wall-clock dependent.
+        ++g_frame_digest_epoch;
+        // Guest input registers came from historical state; the live host
+        // controls become authoritative again before the restored machine
+        // executes a round.
+        publish_keys();
+        if (mouse_down) {
+            set_touch_from_mouse(
+                static_cast<float>(last_touch_event_x),
+                static_cast<float>(last_touch_event_y), true,
+                stacked_bottom_touch);
+        } else {
+            nds_set_touch(0, 0, false);
+        }
+        return result;
+    };
+    runtime_menu_state.save_state = [&](int slot) {
+        execute_savestate_command(
+            {NdsSavestateSlotAction::Save, static_cast<unsigned>(slot)});
+    };
+    runtime_menu_state.load_state = [&](int slot) {
+        execute_savestate_command(
+            {NdsSavestateSlotAction::Load, static_cast<unsigned>(slot)});
+    };
+
+    // ── Live-effect hooks for the settings rows ──────────────────────────
+    // Each one applies immediately to the running presentation. Anything that
+    // cannot be changed without rebuilding a window/renderer (screen layout,
+    // view mode, adaptive widescreen) has no hook, which is why its row is not
+    // requested from the standard builder above.
+    runtime_menu_state.apply_fullscreen = [&](int mode) {
+        options.fullscreen = mode == 2 ? NdsFullscreenMode::Exclusive
+                                       : mode == 1
+                                             ? NdsFullscreenMode::Borderless
+                                             : NdsFullscreenMode::Off;
+        if (!set_window_fullscreen(presentation.windows[0],
+                                   options.fullscreen)) {
+            std::fprintf(stderr, "[sdl] fullscreen apply failed: %s\n",
+                         SDL_GetError());
+        }
+    };
+    runtime_menu_state.apply_window = [&](int scale, int integer) {
+        // Integer scaling is a logical-presentation policy; the window is
+        // resized to match so the two do not fight every time the player
+        // changes one of them. Fullscreen windows ignore a size request.
+        if (presentation.renderers[0]) {
+            SDL_SetRenderLogicalPresentation(
+                presentation.renderers[0], presentation.canvas_width,
+                presentation.single ? presentation.canvas_height
+                                    : kScreenHeight * 2,
+                integer ? SDL_LOGICAL_PRESENTATION_INTEGER_SCALE
+                        : SDL_LOGICAL_PRESENTATION_LETTERBOX);
+        }
+        if (options.fullscreen == NdsFullscreenMode::Off) {
+            SDL_SetWindowSize(presentation.windows[0],
+                              presentation.canvas_width * scale,
+                              (presentation.single
+                                   ? presentation.canvas_height
+                                   : kScreenHeight * 2) * scale);
+        }
+    };
+    runtime_menu_state.apply_filter = [&](int mode) {
+        for (int screen = 0; screen < 2; ++screen) {
+            if (!presentation.textures[screen]) continue;
+            SDL_SetTextureScaleMode(
+                presentation.textures[screen],
+                mode ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST);
+        }
+    };
+    runtime_menu_state.apply_resolution = [&](int scale) {
+        options.internal_resolution = static_cast<uint8_t>(scale);
+        if (!nds_gpu3d_set_runtime_internal_scale(
+                static_cast<uint8_t>(scale))) {
+            std::fprintf(stderr,
+                         "[sdl] internal resolution %d unavailable\n", scale);
+        }
+        presentation.sample_scale =
+            scale > 1 ? 1 : presentation.configured_sample_scale;
+    };
+    runtime_menu_state.apply_audio = [&](int enabled, int volume) {
+        // Gain is the honest control here: it scales the device without
+        // touching the guest SPU (whose own master volume is a Game Boy-style
+        // register the emulated title sets). Zero gain plus a paused device is
+        // "audio off" without changing what the guest produces, so turning it
+        // back on resumes the same stream instead of restarting the prebuffer.
+#if defined(NDS_HAVE_SDL3)
+        if (audio.stream) {
+            SDL_SetAudioStreamGain(
+                audio.stream,
+                enabled ? static_cast<float>(volume) / 100.0f : 0.0f);
+            if (!enabled) pause_audio(audio, true);
+            else if (audio_started) pause_audio(audio, false);
+        }
+#else
+        (void)enabled;
+        (void)volume;
+#endif
+    };
+    runtime_menu_state.apply_backdrop = [&](int dim, int opacity) {
+        if (!runtime_ui) return;
+        recomp_runtime_ui_set_backdrop(
+            runtime_ui, static_cast<float>(dim) / 100.0f,
+            static_cast<float>(opacity) / 100.0f);
+    };
+    runtime_menu_state.apply_pause = [&](int pause) {
+        menu_pauses_game = pause != 0;
+    };
+    runtime_menu_state.apply_fast_forward = [&](int multiplier) {
+        // Adjusting the multiplier while the key is held has to take effect
+        // immediately, so re-arm the ratio. The loop would also notice the new
+        // value on its next iteration, but only if the held state changed --
+        // it has not, so do it here.
+        if (!fast_forward_active) return;
+        const int clamped = multiplier < 1 ? 1 : multiplier;
+#if defined(NDS_HAVE_SDL3)
+        if (audio.stream) {
+            SDL_SetAudioStreamFrequencyRatio(
+                audio.stream, static_cast<float>(clamped));
+        }
+#endif
+        fast_forward_ratio = clamped;
+    };
+    runtime_menu_state.persist = [&]() {
+        if (save_runtime_settings(options.runtime_settings_path,
+                                  runtime_menu_state.settings)) {
+            std::fprintf(stderr, "[sdl] runtime settings saved\n");
+        } else if (!options.runtime_settings_path.empty()) {
+            std::fprintf(stderr, "[sdl] could not write %s\n",
+                         options.runtime_settings_path.c_str());
+        }
+    };
+
+    // ── Startup restore ──────────────────────────────────────────────────
+    // The settings file is read far above, before anything it describes
+    // exists: the presentation, the textures and the audio device are all
+    // built in between. So the value is remembered there and pushed through
+    // the same hooks the menu uses here. Doing it this way means a restored
+    // setting and a just-changed setting travel exactly one code path, and a
+    // hook that breaks shows up in both rather than only at launch.
+    //
+    // Presence, not value: a key that is not in the file leaves the
+    // command-line/default state alone, so an old file cannot silently
+    // override `--fullscreen` or `--window-scale` on the command line.
+    if (runtime_restore.fullscreen && runtime_menu_state.apply_fullscreen)
+        runtime_menu_state.apply_fullscreen(runtime_menu_state.settings.fullscreen);
+    if (runtime_restore.window && runtime_menu_state.apply_window)
+        runtime_menu_state.apply_window(runtime_menu_state.settings.window_scale,
+                                        runtime_menu_state.settings.integer_scale);
+    if (runtime_restore.filter && runtime_menu_state.apply_filter)
+        runtime_menu_state.apply_filter(runtime_menu_state.settings.texture_filter);
+    if (runtime_restore.resolution && runtime_menu_state.apply_resolution)
+        runtime_menu_state.apply_resolution(
+            runtime_menu_state.settings.resolution_scale);
+    if (runtime_restore.audio && runtime_menu_state.apply_audio)
+        runtime_menu_state.apply_audio(runtime_menu_state.settings.audio_enabled,
+                                       runtime_menu_state.settings.volume);
+    // Colour mode and the LCD grid need no line here and no hook: the presenter
+    // reads both out of the settings every presented frame, so a value loaded
+    // from the file is already in force at the first frame. They are still
+    // reported below, because "the file carried it" is worth logging even when
+    // nothing has to be pushed.
+    {
+        // One line that says which persisted settings reached the live
+        // presentation, so a bug report does not have to guess whether the
+        // file was read or restored.
+        std::fprintf(stderr,
+                     "[sdl] settings restored: fullscreen=%d window=%d filter=%d "
+                     "resolution=%d audio=%d mouse=%d color=%d\n",
+                     runtime_restore.fullscreen ? 1 : 0,
+                     runtime_restore.window ? 1 : 0,
+                     runtime_restore.filter ? 1 : 0,
+                     runtime_restore.resolution ? 1 : 0,
+                     runtime_restore.audio ? 1 : 0,
+                     runtime_restore.mouse ? 1 : 0,
+                     runtime_restore.color ? 1 : 0);
+    }
+
+    while (running) {
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+        if (!nds_compute_host_make_current()) {
+            std::fprintf(stderr, "[gpu3d] lost compute GL context: %s\n",
+                         SDL_GetError());
+            compute_failed = true;
+            running = false;
+            break;
+        }
+#endif
+        // Play-mode debug surface: execute any pending TCP command at this
+        // between-frames safe point (no-op when no pump was started or no
+        // client is connected). See debug_server.h.
+        publish_input_debug();
+        debug_pump();
+        const uint64_t fold_serial =
+            g_fold_serial.load(std::memory_order_acquire);
+        if (fold_serial != last_fold_serial) {
+            last_fold_serial = fold_serial;
+            const bool separating =
+                g_fold_separating.load(std::memory_order_relaxed);
+            const int orientation =
+                g_fold_orientation.load(std::memory_order_relaxed);
+            presentation.fold_valid = separating;
+            presentation.fold_horizontal = orientation == 1;
+            presentation.fold_left = static_cast<float>(
+                g_fold_left_permille.load(std::memory_order_relaxed));
+            presentation.fold_top = static_cast<float>(
+                g_fold_top_permille.load(std::memory_order_relaxed));
+            presentation.fold_right = static_cast<float>(
+                g_fold_right_permille.load(std::memory_order_relaxed));
+            presentation.fold_bottom = static_cast<float>(
+                g_fold_bottom_permille.load(std::memory_order_relaxed));
+            reconfigure_single();
+            const char* fold_kind = !separating
+                ? "none"
+                : (presentation.fold_horizontal ? "horizontal"
+                                                : "vertical");
+            std::fprintf(stderr,
+                         "[sdl] fold layout: %s separating=%d "
+                         "rect=%d,%d..%d,%d\n",
+                         fold_kind, separating ? 1 : 0,
+                         static_cast<int>(presentation.fold_left),
+                         static_cast<int>(presentation.fold_top),
+                         static_cast<int>(presentation.fold_right),
+                         static_cast<int>(presentation.fold_bottom));
+        }
+        const uint64_t current_audio_epoch = nds_spu_presentation_epoch();
+        if (current_audio_epoch != audio_presentation_epoch) {
+            // A state load abandoned the samples already buffered in SDL.
+            // Pause the callback/stream before clearing it, then use the normal
+            // short steady-state prebuffer to restart from restored guest time.
+            pause_audio(audio, true);
+            clear_audio_queue(audio, audio_queue);
+            audio_queue.started.store(false, std::memory_order_relaxed);
+            audio_started = false;
+            audio_start_threshold = audio_queue_frames;
+            audio_pace_floor = audio_queue_frames;
+            audio_presentation_epoch = current_audio_epoch;
+        }
+        if (selftest_menu) {
+            const NdsEventCounts& counts = nds_event_counts();
+            SDL_Event injected{};
+            if (!selftest_key_down && counts.vblank9 >= 10) {
+                injected.type = SDL_KEYDOWN;
+                sdl_set_event_scancode(injected, SDL_SCANCODE_Q);
+                injected.key.repeat = 0;
+                selftest_event_error |= !sdl_push_event(injected);
+                selftest_key_down = true;
+            } else if (selftest_key_down && !selftest_key_up &&
+                       counts.vblank9 >= 12) {
+                injected.type = SDL_KEYUP;
+                sdl_set_event_scancode(injected, SDL_SCANCODE_Q);
+                injected.key.repeat = 0;
+                selftest_event_error |= !sdl_push_event(injected);
+                selftest_key_up = true;
+            }
+            if (!selftest_touch_down && g_insn_count[0] >= 42300000) {
+                injected = {};
+                injected.type = SDL_MOUSEBUTTONDOWN;
+                injected.button.windowID = presentation.window_ids[1];
+                injected.button.button = SDL_BUTTON_LEFT;
+                sdl_set_mouse_button_state(injected, true);
+                // Synthetic events use window pixels; the SDL3 frontend path
+                // converts absolute mouse positions into logical DS-space.
+                injected.button.x =
+                    (bottom_content_left + 127) * kWindowScale;
+                injected.button.y = (presentation.separate
+                    ? 180 : 192 + 180) * kWindowScale;
+                selftest_event_error |= !sdl_push_event(injected);
+                selftest_touch_down = true;
+            } else if (selftest_touch_down && !selftest_touch_up &&
+                       counts.vblank9 >= 116) {
+                injected = {};
+                injected.type = SDL_MOUSEBUTTONUP;
+                injected.button.windowID = presentation.window_ids[1];
+                injected.button.button = SDL_BUTTON_LEFT;
+                sdl_set_mouse_button_state(injected, false);
+                injected.button.x =
+                    (bottom_content_left + 127) * kWindowScale;
+                injected.button.y = (presentation.separate
+                    ? 180 : 192 + 180) * kWindowScale;
+                selftest_event_error |= !sdl_push_event(injected);
+                selftest_touch_up = true;
+            }
+        }
+        if (selftest_relative_mouse) {
+            SDL_Event injected{};
+            if (relative_mouse_selftest_stage == 0 && shown_frames >= 2 &&
+                (relative_mouse_selftest_start_vblank == 0 ||
+                 nds_event_counts().vblank9 >=
+                     relative_mouse_selftest_start_vblank)) {
+                std::fprintf(stderr,
+                    "[sdl] relative mouse self-test starting at VBlank %llu\n",
+                    static_cast<unsigned long long>(
+                        nds_event_counts().vblank9));
+                relative_mouse_selftest_error |=
+                    !options.relative_mouse_touch ||
+                    options.relative_mouse_fire_mask == 0;
+                SDL_RaiseWindow(presentation.windows[0]);
+                injected.type = SDL_MOUSEBUTTONDOWN;
+                injected.button.windowID = presentation.window_ids[0];
+                injected.button.button = SDL_BUTTON_LEFT;
+                sdl_set_mouse_button_state(injected, true);
+                // Stacked first verifies that the bottom logical screen
+                // remains touch-only. Separate verifies the traditional
+                // top-window capture path.
+                injected.button.x = presentation.separate
+                    ? 127 * kWindowScale
+                    : (bottom_content_left + 127) * kWindowScale;
+                injected.button.y = presentation.separate
+                    ? 96 * kWindowScale
+                    : (kScreenHeight + 96) * kWindowScale;
+                relative_mouse_selftest_error |= !sdl_push_event(injected);
+                relative_mouse_selftest_stage = 1;
+            } else if (relative_mouse_selftest_stage == 1 &&
+                       shown_frames >= 3) {
+                if (presentation.separate) {
+                    relative_mouse_selftest_error |= !relative_mouse.captured();
+                    injected.type = SDL_MOUSEMOTION;
+                    injected.motion.windowID = presentation.window_ids[0];
+                    injected.motion.xrel = 20;
+                    injected.motion.yrel = -10;
+                    relative_mouse_selftest_stage = 3;
+                } else {
+                    relative_mouse_selftest_error |= relative_mouse.captured() ||
+                        !mouse_down;
+                    injected.type = SDL_MOUSEBUTTONUP;
+                    injected.button.windowID = presentation.window_ids[0];
+                    injected.button.button = SDL_BUTTON_LEFT;
+                    sdl_set_mouse_button_state(injected, false);
+                    injected.button.x =
+                        (bottom_content_left + 127) * kWindowScale;
+                    injected.button.y =
+                        (kScreenHeight + 96) * kWindowScale;
+                    relative_mouse_selftest_stage = 2;
+                }
+                relative_mouse_selftest_error |= !sdl_push_event(injected);
+            } else if (relative_mouse_selftest_stage == 2 &&
+                       shown_frames >= 4) {
+                relative_mouse_selftest_error |= mouse_down;
+                injected.type = SDL_MOUSEBUTTONDOWN;
+                injected.button.windowID = presentation.window_ids[0];
+                injected.button.button = SDL_BUTTON_LEFT;
+                sdl_set_mouse_button_state(injected, true);
+                injected.button.x =
+                    (top_content_left + 127) * kWindowScale;
+                injected.button.y = 96 * kWindowScale;
+                relative_mouse_selftest_error |= !sdl_push_event(injected);
+                relative_mouse_selftest_stage = 3;
+            } else if (relative_mouse_selftest_stage == 3 &&
+                       shown_frames >= 5) {
+                relative_mouse_selftest_error |= !relative_mouse.captured();
+                injected.type = SDL_MOUSEMOTION;
+                injected.motion.windowID = presentation.window_ids[0];
+                injected.motion.xrel = 20;
+                injected.motion.yrel = -10;
+                relative_mouse_selftest_error |= !sdl_push_event(injected);
+                relative_mouse_selftest_stage = 4;
+            } else if (relative_mouse_selftest_stage == 4 &&
+                       shown_frames >= 6) {
+                relative_mouse_selftest_error |=
+                    options.relative_mouse_direct_aim
+                        ? relative_direct_writes == 0
+                        : (relative_mouse.x() == 128 &&
+                           relative_mouse.y() == 96);
+                injected.type = SDL_MOUSEBUTTONDOWN;
+                injected.button.windowID = presentation.window_ids[0];
+                injected.button.button = SDL_BUTTON_LEFT;
+                sdl_set_mouse_button_state(injected, true);
+                relative_mouse_selftest_error |= !sdl_push_event(injected);
+                relative_mouse_selftest_stage = 5;
+            } else if (relative_mouse_selftest_stage == 5 &&
+                       shown_frames >= 7) {
+                relative_mouse_selftest_error |=
+                    mouse_pressed != options.relative_mouse_fire_mask;
+                std::fprintf(stderr,
+                    "[sdl] relative mouse fire asserted at VBlank %llu\n",
+                    static_cast<unsigned long long>(
+                        nds_event_counts().vblank9));
+                injected.type = SDL_MOUSEBUTTONUP;
+                injected.button.windowID = presentation.window_ids[0];
+                injected.button.button = SDL_BUTTON_LEFT;
+                sdl_set_mouse_button_state(injected, false);
+                relative_mouse_selftest_error |= !sdl_push_event(injected);
+                relative_mouse_selftest_stage = 6;
+            } else if (relative_mouse_selftest_stage == 6 &&
+                       shown_frames >= 8) {
+                relative_mouse_selftest_error |= mouse_pressed != 0;
+                injected.type = SDL_KEYDOWN;
+                sdl_set_event_scancode(injected, SDL_SCANCODE_ESCAPE);
+                relative_mouse_selftest_error |= !sdl_push_event(injected);
+                relative_mouse_selftest_stage = 7;
+            } else if (relative_mouse_selftest_stage == 7 &&
+                       shown_frames >= 9) {
+                relative_mouse_selftest_error |=
+                    relative_mouse.captured() || mouse_pressed != 0;
+                injected.type = SDL_MOUSEBUTTONDOWN;
+                injected.button.windowID = presentation.window_ids[0];
+                injected.button.button = SDL_BUTTON_LEFT;
+                sdl_set_mouse_button_state(injected, true);
+                injected.button.x =
+                    (top_content_left + 127) * kWindowScale;
+                injected.button.y = 96 * kWindowScale;
+                relative_mouse_selftest_error |= !sdl_push_event(injected);
+                relative_mouse_selftest_stage = 8;
+            } else if (relative_mouse_selftest_stage == 8 &&
+                       shown_frames >= 10) {
+                relative_mouse_selftest_error |= !relative_mouse.captured();
+                sdl_make_window_event(
+                    injected, SDL_EVENT_WINDOW_FOCUS_LOST,
+                    presentation.window_ids[0]);
+                relative_mouse_selftest_error |= !sdl_push_event(injected);
+                relative_mouse_selftest_stage = 9;
+            } else if (relative_mouse_selftest_stage == 9 &&
+                       shown_frames >= 11) {
+                relative_mouse_selftest_error |=
+                    relative_mouse.captured() || mouse_pressed != 0;
+                relative_mouse_selftest_stage = 10;
+            }
+        }
+        virtual_controls.visible =
+            presentation.single &&
+            (options.virtual_controls == NdsVirtualControlsMode::On ||
+             (options.virtual_controls == NdsVirtualControlsMode::Auto &&
+              !controller));
+        if (!virtual_controls.visible) {
+            const bool had_pressed = virtual_controls_pressed != 0;
+            for (auto& button : virtual_controls.buttons) {
+                button.held = false;
+                button.anim = 0.0f;
+                button.velocity = 0.0f;
+            }
+            virtual_controls.mouse_button = -1;
+            for (int& index : virtual_controls.finger_button) index = -1;
+            virtual_controls_pressed = 0;
+            if (had_pressed) publish_keys();
+        }
+        SDL_Event event{};
+        while (SDL_PollEvent(&event)) {
+            convert_mouse_event_to_logical_coordinates(event, presentation);
+            if (virtual_controls.visible &&
+                event.type == SDL_MOUSEBUTTONDOWN &&
+                event.button.button == SDL_BUTTON_LEFT &&
+                event.button.windowID == presentation.window_ids[0]) {
+                const int index = virtual_control_at(
+                    presentation, event.button.x, event.button.y);
+                if (index >= 0) {
+                    virtual_controls.mouse_button = index;
+                    virtual_controls.buttons[index].held = true;
+                    virtual_controls_pressed =
+                        virtual_controls_mask(virtual_controls);
+                    publish_keys();
+                    continue;
+                }
+            }
+            if (virtual_controls.visible &&
+                event.type == SDL_MOUSEMOTION &&
+                virtual_controls.mouse_button >= 0) {
+                const int next = virtual_control_at(
+                    presentation, event.motion.x, event.motion.y);
+                if (next != virtual_controls.mouse_button) {
+                    virtual_controls.buttons[
+                        virtual_controls.mouse_button].held = false;
+                    virtual_controls.mouse_button = next;
+                    if (next >= 0) virtual_controls.buttons[next].held = true;
+                    virtual_controls_pressed =
+                        virtual_controls_mask(virtual_controls);
+                    publish_keys();
+                }
+                continue;
+            }
+            if (virtual_controls.visible &&
+                event.type == SDL_MOUSEBUTTONUP &&
+                event.button.button == SDL_BUTTON_LEFT &&
+                virtual_controls.mouse_button >= 0) {
+                virtual_controls.buttons[
+                    virtual_controls.mouse_button].held = false;
+                virtual_controls.mouse_button = -1;
+                virtual_controls_pressed =
+                    virtual_controls_mask(virtual_controls);
+                publish_keys();
+                continue;
+            }
+            if (virtual_controls.visible &&
+                (event.type == SDL_FINGERDOWN ||
+                 event.type == SDL_FINGERMOTION ||
+                 event.type == SDL_FINGERUP)) {
+                int slot = -1;
+                for (int i = 0; i < 8; ++i) {
+                    if (virtual_controls.finger_id[i] ==
+                        event.tfinger.fingerID) {
+                        slot = i;
+                        break;
+                    }
+                }
+                int window_width = 0;
+                int window_height = 0;
+                SDL_GetWindowSize(presentation.windows[0], &window_width,
+                                  &window_height);
+                float logical_x = event.tfinger.x * window_width;
+                float logical_y = event.tfinger.y * window_height;
+                SDL_RenderCoordinatesFromWindow(
+                    presentation.renderers[0], logical_x, logical_y,
+                    &logical_x, &logical_y);
+                const int index = virtual_control_at(
+                    presentation, logical_x, logical_y);
+                if (slot < 0 && index >= 0) {
+                    for (int i = 0; i < 8; ++i) {
+                        if (virtual_controls.finger_id[i] < 0) {
+                            slot = i;
+                            break;
+                        }
+                    }
+                    if (slot >= 0) {
+                        virtual_controls.finger_id[slot] =
+                            event.tfinger.fingerID;
+                        virtual_controls.finger_button[slot] = index;
+                    }
+                }
+                if (slot >= 0) {
+                    const int previous =
+                        virtual_controls.finger_button[slot];
+                    if (event.type == SDL_FINGERUP) {
+                        if (previous >= 0)
+                            virtual_controls.buttons[previous].held = false;
+                        virtual_controls.finger_id[slot] = -1;
+                        virtual_controls.finger_button[slot] = -1;
+                    } else if (index >= 0 &&
+                               index != virtual_controls.finger_button[slot]) {
+                        if (previous >= 0)
+                            virtual_controls.buttons[previous].held = false;
+                        virtual_controls.finger_button[slot] = index;
+                        virtual_controls.buttons[index].held = true;
+                    }
+                    virtual_controls_pressed =
+                        virtual_controls_mask(virtual_controls);
+                    publish_keys();
+                    continue;
+                }
+            }
+            if (event.type == SDL_QUIT) {
+                release_relative_mouse();
+                running = false;
+            }
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_CLOSE_REQUESTED)) {
+                release_relative_mouse();
+                running = false;
+            }
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_FOCUS_LOST) &&
+                is_presentation_window(event.window.windowID)) {
+                const int index =
+                    presentation_window_focus_index(event.window.windowID);
+                if (index >= 0)
+                    presentation_window_focused[index] = false;
+                if (mph_prime_unified_window_focus)
+                    focus_release_pending = true;
+                else {
+                    release_relative_mouse();
+                    clear_tab_turbo();
+                    clear_fast_forward();
+                }
+            }
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_FOCUS_GAINED) &&
+                is_presentation_window(event.window.windowID)) {
+                const int index =
+                    presentation_window_focus_index(event.window.windowID);
+                if (index >= 0)
+                    presentation_window_focused[index] = true;
+                focus_release_pending = false;
+            }
+#if defined(NDS_HAVE_SDL3)
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_RESIZED) ||
+                sdl_window_event_is(event, SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) ||
+                sdl_window_event_is(event, SDL_EVENT_WINDOW_DISPLAY_CHANGED)) {
+                reconfigure_single();
+            }
+#endif
+            // NDS_DEBUG_KEYEV=1: trace every polled keyboard event to stderr.
+            // Exists because an injected key that vanishes between
+            // SDL_PushEvent (debug pump, counted) and this loop is otherwise
+            // undiagnosable -- the 2026-08-31 A/B session lost an evening leg
+            // to exactly that.
+            static const bool debug_keyev = [] {
+                const char* v = std::getenv("NDS_DEBUG_KEYEV");
+                return v && v[0] == '1';
+            }();
+            if (debug_keyev &&
+                (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP)) {
+                std::fprintf(stderr, "[keyev] type=%u scancode=%d repeat=%d\n",
+                             (unsigned)event.type,
+                             (int)sdl_event_scancode(event),
+                             (int)event.key.repeat);
+            }
+            if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
+                RecompRuntimeUiInput menu_input{};
+                const SDL_Scancode scancode = sdl_event_scancode(event);
+                const bool was_open = runtime_menu_open();
+                const bool known = runtime_menu_key_input(
+                    scancode, &menu_input);
+                if (known && runtime_ui &&
+                    recomp_runtime_ui_handle_input(
+                        runtime_ui, menu_input, event.type == SDL_KEYDOWN,
+                        event.key.repeat)) {
+                    finish_runtime_menu_input(was_open);
+                    continue;
+                }
+                if (was_open) {
+                    finish_runtime_menu_input(was_open);
+                    continue;
+                }
+            }
+            if (event.type == SDL_KEYDOWN && !event.key.repeat) {
+                const SDL_Scancode scancode = sdl_event_scancode(event);
+                NdsSavestateSlotCommand state_command{};
+                const unsigned function_key = savestate_function_key(scancode);
+                const bool state_shortcut = nds_savestate_slot_shortcut(
+                    function_key, sdl_event_shift(event), false,
+                    &state_command);
+                if (state_shortcut) {
+                    execute_savestate_command(state_command);
+                } else if (scancode == SDL_SCANCODE_ESCAPE) {
+                    if (relative_mouse.captured() || virtual_stylus_active())
+                        release_relative_mouse();
+                    else
+                        running = false;
+                } else if (process_virtual_stylus_key(scancode, true)) {
+                    // Consumed by the generic lower-screen pointer helper.
+                } else if (process_mph_prime_key(
+                               scancode, true, false)) {
+                    // Consumed by the MPH-specific keyboard/mouse layer.
+                } else if (options.tab_turbo &&
+                           scancode == SDL_SCANCODE_TAB) {
+                    turbo_pressed = true;
+                } else if (scancode == SDL_SCANCODE_LSHIFT &&
+                           runtime_menu_state.settings.fast_forward > 1) {
+                    // Held, so this is the press and the KEYUP path clears it.
+                    // Left shift is not a DS button and the savestate modifiers
+                    // ride on the F keys, so nothing else consumes it.
+                    fast_forward_pressed = true;
+                } else if (mph_prime_active()) {
+                    // Prime Controls replaces the normal keyboard keypad map;
+                    // unbound keys must not leak through as DS buttons.
+                } else if (const uint16_t bit = key_bit(scancode)) {
+                    ++host_key_presses;
+                    keyboard_pressed |= bit;
+                    publish_keys();
+                }
+            }
+            if (event.type == SDL_KEYUP && !event.key.repeat) {
+                const SDL_Scancode scancode = sdl_event_scancode(event);
+                if (process_virtual_stylus_key(scancode, false)) {
+                    // Consumed by the generic lower-screen pointer helper.
+                } else if (process_mph_prime_key(
+                        scancode, false, false)) {
+                    // Consumed by the MPH-specific keyboard/mouse layer.
+                } else if (options.tab_turbo &&
+                           scancode == SDL_SCANCODE_TAB) {
+                    turbo_pressed = false;
+                } else if (scancode == SDL_SCANCODE_LSHIFT) {
+                    fast_forward_pressed = false;
+                } else if (mph_prime_active()) {
+                    // See keydown path: ignore generic keyboard bindings
+                    // while the Prime Controls capture owns the keyboard.
+                } else if (const uint16_t bit = key_bit(scancode)) {
+                    keyboard_pressed &= static_cast<uint16_t>(~bit);
+                    publish_keys();
+                }
+            }
+            if (event.type == SDL_CONTROLLERDEVICEADDED && !controller) {
+                controller =
+                    SDL_GameControllerOpen(sdl_controller_device_id(event));
+                if (controller) {
+                    controller_id = sdl_controller_id(controller);
+                    std::fprintf(stderr,
+                                 "[sdl] Player 1 controller: %s\n",
+                                 SDL_GameControllerName(controller));
+                }
+            }
+            if (event.type == SDL_CONTROLLERDEVICEREMOVED &&
+                controller && sdl_controller_device_id(event) == controller_id) {
+                SDL_GameControllerClose(controller);
+                controller = nullptr;
+                controller_id = -1;
+                controller_pressed = 0;
+                // Pad-held Prime actions must not survive the device; the
+                // keyboard/mouse can re-press theirs on the next event.
+                clear_mph_prime_controls();
+                clear_virtual_stylus();
+                publish_keys();
+            }
+            if (event.type == SDL_CONTROLLERBUTTONDOWN ||
+                event.type == SDL_CONTROLLERBUTTONUP) {
+                RecompRuntimeUiInput menu_input{};
+                const bool was_open = runtime_menu_open();
+                const auto button = static_cast<SDL_GameControllerButton>(
+                    sdl_controller_button(event));
+                if (runtime_menu_controller_input(button, &menu_input) &&
+                    runtime_ui &&
+                    recomp_runtime_ui_handle_input(
+                        runtime_ui, menu_input,
+                        event.type == SDL_CONTROLLERBUTTONDOWN, false)) {
+                    finish_runtime_menu_input(was_open);
+                    continue;
+                }
+                if (was_open) {
+                    finish_runtime_menu_input(was_open);
+                    continue;
+                }
+            }
+            if (event.type == SDL_CONTROLLERBUTTONDOWN) {
+                const auto button = static_cast<SDL_GameControllerButton>(
+                    sdl_controller_button(event));
+                if (process_virtual_stylus_pad(MphPadInputKind::Button,
+                                               button, true)) {
+                    // Consumed by the generic lower-screen pointer helper.
+                } else if (process_mph_prime_pad(MphPadInputKind::Button, button,
+                                          true)) {
+                    // Consumed by Prime Controls.
+                } else if (const uint16_t bit = controller_bit(button)) {
+                    controller_pressed |= bit;
+                    publish_keys();
+                }
+            }
+            if (event.type == SDL_CONTROLLERBUTTONUP) {
+                const auto button = static_cast<SDL_GameControllerButton>(
+                    sdl_controller_button(event));
+                if (process_virtual_stylus_pad(MphPadInputKind::Button,
+                                               button, false)) {
+                    // Consumed by the generic lower-screen pointer helper.
+                } else if (process_mph_prime_pad(MphPadInputKind::Button, button,
+                                          false)) {
+                    // Consumed by Prime Controls.
+                } else if (const uint16_t bit = controller_bit(button)) {
+                    controller_pressed &= static_cast<uint16_t>(~bit);
+                    publish_keys();
+                }
+            }
+            if (runtime_menu_open() &&
+                (event.type == SDL_MOUSEBUTTONDOWN ||
+                 event.type == SDL_MOUSEBUTTONUP ||
+                 event.type == SDL_MOUSEMOTION)) {
+                continue;
+            }
+            const bool primary_left_down =
+                event.type == SDL_MOUSEBUTTONDOWN &&
+                event.button.button == SDL_BUTTON_LEFT &&
+                event.button.windowID == presentation.window_ids[0];
+            const bool bottom_left_down =
+                event.type == SDL_MOUSEBUTTONDOWN &&
+                event.button.button == SDL_BUTTON_LEFT &&
+                presentation.separate &&
+                event.button.windowID == presentation.window_ids[1];
+            const bool relative_left_down =
+                primary_left_down ||
+                (bottom_left_down && mph_prime_unified_window_focus);
+            const NdsStackedRelativeMouseRoute stacked_left_route =
+                primary_left_down && !presentation.separate
+                    ? nds_route_stacked_relative_mouse_button(
+                        options.relative_mouse_touch,
+                        relative_mouse.captured(), stacked_top_screen,
+                        stacked_bottom_touch, event.button.x, event.button.y)
+                    : NdsStackedRelativeMouseRoute::None;
+            bool virtual_stylus_mouse_consumed = false;
+            if (event.type == SDL_MOUSEBUTTONDOWN &&
+                is_presentation_window(event.button.windowID)) {
+                if (process_virtual_stylus_mouse_hold(
+                        event.button.button, true)) {
+                    virtual_stylus_mouse_consumed = true;
+                } else if (process_virtual_stylus_mouse_tap(
+                               event.button.button, true)) {
+                    virtual_stylus_mouse_consumed = true;
+                } else if (event.button.button == SDL_BUTTON_LEFT &&
+                           virtual_stylus_active()) {
+                    virtual_stylus_tap_held = true;
+                    virtual_stylus_mouse_consumed = true;
+                }
+            }
+            if (!virtual_stylus_mouse_consumed &&
+                relative_left_down && options.relative_mouse_touch &&
+                (presentation.separate ||
+                 stacked_left_route ==
+                     NdsStackedRelativeMouseRoute::AcquireRelative ||
+                 stacked_left_route ==
+                     NdsStackedRelativeMouseRoute::CapturedButton)) {
+                if (!relative_mouse.captured()) {
+                    // The acquisition click only captures; the next click is
+                    // the first guest fire press, avoiding an accidental shot.
+                    capture_relative_mouse();
+                } else if (process_mph_prime_mouse(
+                               event.button.button, true, false)) {
+                    // Consumed by Prime Controls.
+                } else if (options.relative_mouse_fire_mask != 0) {
+                    mouse_pressed |= options.relative_mouse_fire_mask;
+                    publish_keys();
+                }
+            }
+            if (!virtual_stylus_mouse_consumed &&
+                event.type == SDL_MOUSEBUTTONDOWN &&
+                event.button.button != SDL_BUTTON_LEFT &&
+                (event.button.windowID == presentation.window_ids[0] ||
+                 (mph_prime_unified_window_focus &&
+                  is_presentation_window(event.button.windowID))) &&
+                process_mph_prime_mouse(event.button.button, true, false)) {
+                // Consumed by Prime Controls.
+            }
+            if (event.type == SDL_MOUSEBUTTONUP &&
+                is_presentation_window(event.button.windowID)) {
+                if (process_virtual_stylus_mouse_hold(
+                        event.button.button, false)) {
+                    virtual_stylus_mouse_consumed = true;
+                } else if (process_virtual_stylus_mouse_tap(
+                               event.button.button, false)) {
+                    virtual_stylus_mouse_consumed = true;
+                } else if (event.button.button == SDL_BUTTON_LEFT &&
+                           virtual_stylus_tap_held) {
+                    virtual_stylus_tap_held = false;
+                    virtual_stylus_mouse_consumed = true;
+                }
+            }
+            if (!virtual_stylus_mouse_consumed &&
+                event.type == SDL_MOUSEBUTTONUP &&
+                (event.button.windowID == presentation.window_ids[0] ||
+                 (mph_prime_unified_window_focus &&
+                  is_presentation_window(event.button.windowID))) &&
+                relative_mouse.captured()) {
+                if (process_mph_prime_mouse(
+                        event.button.button, false, false)) {
+                    // Consumed by Prime Controls.
+                } else if (event.button.button == SDL_BUTTON_LEFT &&
+                           mouse_pressed != 0) {
+                    mouse_pressed &= static_cast<uint16_t>(
+                        ~options.relative_mouse_fire_mask);
+                    publish_keys();
+                }
+            }
+            if (!virtual_stylus_mouse_consumed &&
+                event.type == SDL_MOUSEBUTTONDOWN &&
+                event.button.button == SDL_BUTTON_LEFT &&
+                event.button.windowID == presentation.window_ids[1] &&
+                !(mph_prime_unified_window_focus &&
+                  relative_mouse.captured()) &&
+                (presentation.separate
+                    ? event.button.x >= bottom_content_left &&
+                          event.button.x < bottom_content_left + kScreenWidth
+                    : stacked_left_route ==
+                          NdsStackedRelativeMouseRoute::Touchscreen)) {
+                mouse_down = true;
+                ++host_touch_presses;
+                last_touch_event_x = event.button.x;
+                last_touch_event_y = event.button.y;
+                touch_release_pending = false;
+                touch_frames_held = 0;
+                set_touch_from_mouse(event.button.x, event.button.y, true,
+                                     stacked_bottom_touch);
+            }
+            if (!virtual_stylus_mouse_consumed &&
+                event.type == SDL_MOUSEBUTTONUP &&
+                event.button.button == SDL_BUTTON_LEFT &&
+                event.button.windowID == presentation.window_ids[1] &&
+                mouse_down) {
+                mouse_down = false;
+                // A host click can begin and end while the emulation thread is
+                // rendering one slow frame. Keep such a click asserted long
+                // enough for the ARM7 touchscreen polling path to observe it.
+                if (touch_frames_held < 2)
+                    touch_release_pending = true;
+                else
+                    set_touch_from_mouse(event.button.x, event.button.y, false,
+                                         stacked_bottom_touch);
+            }
+            if (event.type == SDL_MOUSEMOTION && mouse_down &&
+                event.motion.windowID == presentation.window_ids[1])
+                set_touch_from_mouse(event.motion.x, event.motion.y, true,
+                                     stacked_bottom_touch);
+            if (event.type == SDL_MOUSEMOTION &&
+                virtual_stylus_active() &&
+                (event.motion.windowID == presentation.window_ids[0] ||
+                 is_presentation_window(event.motion.windowID) ||
+                 event.motion.windowID == 0)) {
+                mph_virtual_x +=
+                    static_cast<float>(event.motion.xrel) *
+                    options.virtual_stylus.sensitivity * 0.01f;
+                mph_virtual_y +=
+                    static_cast<float>(event.motion.yrel) *
+                    (256.0f / 192.0f) *
+                    options.virtual_stylus.sensitivity * 0.01f;
+                mph_virtual_x = std::clamp(mph_virtual_x, 0.0f, 255.0f);
+                mph_virtual_y = std::clamp(mph_virtual_y, 0.0f, 191.0f);
+            } else if (event.type == SDL_MOUSEMOTION &&
+                relative_mouse.captured() &&
+                (event.motion.windowID == presentation.window_ids[0] ||
+                 (mph_prime_unified_window_focus &&
+                  is_presentation_window(event.motion.windowID)) ||
+                 event.motion.windowID == 0)) {
+                const bool prime_virtual_stylus = mph_prime_active() &&
+                    mph_prime_held[static_cast<size_t>(
+                        MphPrimeAction::VirtualStylus)];
+                if (prime_virtual_stylus) {
+                    mph_virtual_x +=
+                        static_cast<float>(event.motion.xrel) *
+                        options.mph_virtual_stylus_sensitivity * 0.01f;
+                    mph_virtual_y +=
+                        static_cast<float>(event.motion.yrel) *
+                        (256.0f / 192.0f) *
+                        options.mph_virtual_stylus_sensitivity * 0.01f;
+                    mph_virtual_x = std::clamp(mph_virtual_x, 0.0f, 255.0f);
+                    mph_virtual_y = std::clamp(mph_virtual_y, 0.0f, 191.0f);
+                } else if (options.relative_mouse_direct_aim) {
+                    relative_delta_x += event.motion.xrel;
+                    relative_delta_y += event.motion.yrel;
+                } else if (relative_mouse.move(event.motion.xrel,
+                                               event.motion.yrel)) {
+                    nds_set_touch(relative_mouse.x(), relative_mouse.y(), true);
+                }
+            }
+            if (sdl_window_event_is(event, SDL_EVENT_WINDOW_MOUSE_LEAVE) &&
+                mouse_down &&
+                event.window.windowID == presentation.window_ids[1]) {
+                mouse_down = false;
+                if (touch_frames_held < 2)
+                    touch_release_pending = true;
+                else
+                    nds_set_touch(0, 0, false);
+            }
+        }
+        if (focus_release_pending) {
+            if (!any_presentation_window_focused()) {
+                release_relative_mouse();
+                clear_tab_turbo();
+                clear_fast_forward();
+            }
+            focus_release_pending = false;
+        }
+
+        // ── Gamepad dual-stick poll (once per shown frame) ───────────────
+        mph_pad_frame_x = 0;
+        mph_pad_frame_y = 0;
+        if (controller) {
+            // Left stick -> D-pad, with hysteresis so a stick resting near
+            // a threshold never flickers a direction.
+            const float lx = SDL_GameControllerGetAxis(
+                controller, SDL_CONTROLLER_AXIS_LEFTX) / 32767.0f;
+            const float ly = SDL_GameControllerGetAxis(
+                controller, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
+            const bool menu_open = runtime_menu_open();
+            if (menu_open) {
+                if (stick_pressed != 0) {
+                    stick_pressed = 0;
+                    publish_keys();
+                }
+                bool have_stick_input = false;
+                RecompRuntimeUiInput stick_input =
+                    RECOMP_RUNTIME_UI_INPUT_DOWN;
+                const float ax = std::fabs(lx);
+                const float ay = std::fabs(ly);
+                if (std::max(ax, ay) > 0.5f) {
+                    have_stick_input = true;
+                    if (ax > ay)
+                        stick_input = lx > 0.0f
+                            ? RECOMP_RUNTIME_UI_INPUT_RIGHT
+                            : RECOMP_RUNTIME_UI_INPUT_LEFT;
+                    else
+                        stick_input = ly > 0.0f
+                            ? RECOMP_RUNTIME_UI_INPUT_DOWN
+                            : RECOMP_RUNTIME_UI_INPUT_UP;
+                }
+                if (have_stick_input) {
+                    const bool same = runtime_stick_held &&
+                                      runtime_stick_input == stick_input;
+                    if (!same) {
+                        runtime_stick_held = true;
+                        runtime_stick_input = stick_input;
+                        runtime_stick_frames = 0;
+                        recomp_runtime_ui_handle_input(
+                            runtime_ui, stick_input, 1, 0);
+                    } else if (++runtime_stick_frames >= 18 &&
+                               ((runtime_stick_frames - 18) % 5) == 0) {
+                        recomp_runtime_ui_handle_input(
+                            runtime_ui, stick_input, 1, 1);
+                    }
+                } else {
+                    runtime_stick_held = false;
+                    runtime_stick_frames = 0;
+                }
+            } else {
+                runtime_stick_held = false;
+                runtime_stick_frames = 0;
+                auto stick_dir = [&](float value, uint16_t bit, bool positive) {
+                    const float v = positive ? value : -value;
+                    const bool held = (stick_pressed & bit) != 0;
+                    const bool next = v > (held ? 0.35f : 0.5f);
+                    if (next != held) {
+                        if (next) stick_pressed |= bit;
+                        else stick_pressed &= static_cast<uint16_t>(~bit);
+                        publish_keys();
+                    }
+                };
+                stick_dir(lx, 1u << 4, true);    // Right
+                stick_dir(lx, 1u << 5, false);   // Left
+                stick_dir(ly, 1u << 6, false);   // Up (SDL Y axis points down)
+                stick_dir(ly, 1u << 7, true);    // Down
+            }
+
+            if (!menu_open && virtual_stylus_available) {
+                const float rx = SDL_GameControllerGetAxis(
+                    controller, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
+                const float ry = SDL_GameControllerGetAxis(
+                    controller, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
+                const bool trigger_right = SDL_GameControllerGetAxis(
+                    controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 9830;
+                const bool trigger_left = SDL_GameControllerGetAxis(
+                    controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 9830;
+                if (trigger_right != virtual_stylus_pad_trigger_right_held) {
+                    virtual_stylus_pad_trigger_right_held = trigger_right;
+                    process_virtual_stylus_pad(MphPadInputKind::TriggerRight,
+                                              SDL_CONTROLLER_BUTTON_INVALID,
+                                              trigger_right);
+                }
+                if (trigger_left != virtual_stylus_pad_trigger_left_held) {
+                    virtual_stylus_pad_trigger_left_held = trigger_left;
+                    process_virtual_stylus_pad(MphPadInputKind::TriggerLeft,
+                                              SDL_CONTROLLER_BUTTON_INVALID,
+                                              trigger_left);
+                }
+                const float mag = std::sqrt(rx * rx + ry * ry);
+                constexpr float kVirtualStylusDeadzone = 0.25f;
+                if (virtual_stylus_active() && mag > kVirtualStylusDeadzone) {
+                    const float curved =
+                        (mag - kVirtualStylusDeadzone) /
+                        (1.0f - kVirtualStylusDeadzone);
+                    const float rate = curved * curved * 5.0f *
+                        (options.virtual_stylus.pad_sensitivity / 100.0f) /
+                        mag;
+                    virtual_stylus_pad_rem_x += rx * rate;
+                    virtual_stylus_pad_rem_y += ry * rate *
+                        (256.0f / 192.0f);
+                    const int32_t pad_x =
+                        static_cast<int32_t>(virtual_stylus_pad_rem_x);
+                    const int32_t pad_y =
+                        static_cast<int32_t>(virtual_stylus_pad_rem_y);
+                    virtual_stylus_pad_rem_x -= static_cast<float>(pad_x);
+                    virtual_stylus_pad_rem_y -= static_cast<float>(pad_y);
+                    mph_virtual_x = std::clamp(
+                        mph_virtual_x + static_cast<float>(pad_x),
+                        0.0f, 255.0f);
+                    mph_virtual_y = std::clamp(
+                        mph_virtual_y + static_cast<float>(pad_y),
+                        0.0f, 191.0f);
+                }
+            }
+
+            if (!menu_open && mph_prime_controls_available) {
+                // Right stick -> camera aim; triggers act as bindable
+                // pseudo-buttons (defaults: RT shoot, LT scan-fire).
+                const float rx = SDL_GameControllerGetAxis(
+                    controller, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
+                const float ry = SDL_GameControllerGetAxis(
+                    controller, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
+                const bool trigger_right = SDL_GameControllerGetAxis(
+                    controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 9830;
+                const bool trigger_left = SDL_GameControllerGetAxis(
+                    controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 9830;
+                if (trigger_right != mph_pad_trigger_right_held) {
+                    mph_pad_trigger_right_held = trigger_right;
+                    process_mph_prime_pad(MphPadInputKind::TriggerRight,
+                                          SDL_CONTROLLER_BUTTON_INVALID,
+                                          trigger_right);
+                }
+                if (trigger_left != mph_pad_trigger_left_held) {
+                    mph_pad_trigger_left_held = trigger_left;
+                    process_mph_prime_pad(MphPadInputKind::TriggerLeft,
+                                          SDL_CONTROLLER_BUTTON_INVALID,
+                                          trigger_left);
+                }
+                const float mag = std::sqrt(rx * rx + ry * ry);
+                constexpr float kDeadzone = 0.25f;
+                const bool aiming = mag > kDeadzone;
+                if (aiming || trigger_right || trigger_left) {
+                    mph_pad_idle_frames = 0;
+                    if (!mph_prime_pad_engaged) {
+                        mph_prime_pad_engaged = true;
+                        std::fprintf(stderr,
+                            "[sdl] MPH pad aim engaged (right stick / "
+                            "triggers); idles out when released\n");
+                    }
+                } else if (mph_prime_pad_engaged &&
+                           !relative_mouse.captured() &&
+                           ++mph_pad_idle_frames > 45) {
+                    mph_prime_pad_engaged = false;
+                    nds_set_touch(0, 0, false);
+                }
+                if (aiming && mph_prime_pad_engaged) {
+                    // Square-law response: fine aim near center, a full
+                    // deflection turns at the built-in rate scaled by the
+                    // pad sensitivity. Y keeps the mouse path's 150% scale
+                    // and follows the same invert option.
+                    const float curved =
+                        (mag - kDeadzone) / (1.0f - kDeadzone);
+                    const float rate = curved * curved * 5.0f *
+                        (options.mph_pad_aim_sensitivity / 100.0f) / mag;
+                    mph_pad_aim_rem_x += rx * rate;
+                    mph_pad_aim_rem_y += ry * rate * 1.5f *
+                        (options.relative_mouse_invert_y ? -1.0f : 1.0f);
+                    mph_pad_frame_x =
+                        static_cast<int32_t>(mph_pad_aim_rem_x);
+                    mph_pad_frame_y =
+                        static_cast<int32_t>(mph_pad_aim_rem_y);
+                    mph_pad_aim_rem_x -= static_cast<float>(mph_pad_frame_x);
+                    mph_pad_aim_rem_y -= static_cast<float>(mph_pad_frame_y);
+                }
+            }
+        } else {
+            runtime_stick_held = false;
+            runtime_stick_frames = 0;
+            if (stick_pressed != 0) {
+                stick_pressed = 0;
+                publish_keys();
+            }
+            if (mph_pad_trigger_right_held) {
+                mph_pad_trigger_right_held = false;
+                process_mph_prime_pad(MphPadInputKind::TriggerRight,
+                                      SDL_CONTROLLER_BUTTON_INVALID, false);
+            }
+            if (mph_pad_trigger_left_held) {
+                mph_pad_trigger_left_held = false;
+                process_mph_prime_pad(MphPadInputKind::TriggerLeft,
+                                      SDL_CONTROLLER_BUTTON_INVALID, false);
+            }
+            if (virtual_stylus_pad_trigger_right_held) {
+                virtual_stylus_pad_trigger_right_held = false;
+                process_virtual_stylus_pad(MphPadInputKind::TriggerRight,
+                                          SDL_CONTROLLER_BUTTON_INVALID,
+                                          false);
+            }
+            if (virtual_stylus_pad_trigger_left_held) {
+                virtual_stylus_pad_trigger_left_held = false;
+                process_virtual_stylus_pad(MphPadInputKind::TriggerLeft,
+                                          SDL_CONTROLLER_BUTTON_INVALID,
+                                          false);
+            }
+            if (mph_prime_pad_engaged) {
+                mph_prime_pad_engaged = false;
+                if (!relative_mouse.captured()) nds_set_touch(0, 0, false);
+            }
+            if (virtual_stylus_pad_held) clear_virtual_stylus();
+        }
+
+        const bool mph_prime_is_active = mph_prime_active();
+        const bool mph_prime_virtual_stylus = mph_prime_is_active &&
+            mph_prime_held[static_cast<size_t>(
+                MphPrimeAction::VirtualStylus)];
+        const bool generic_virtual_stylus = virtual_stylus_active();
+
+        const bool turbo_want = turbo_pressed || nds_debug_turbo();
+        if (turbo_want != turbo_active) {
+            turbo_active = turbo_want;
+            if (audio) {
+                pause_audio(audio, true);
+                clear_audio_queue(audio, audio_queue);
+                audio_queue.started.store(false, std::memory_order_relaxed);
+            }
+            audio_started = false;
+            audio_start_threshold = audio_queue_frames;
+            audio_pace_floor = audio_start_threshold;
+            audio_min_queue = std::numeric_limits<uint32_t>::max();
+            audio_max_queue = 0;
+            std::fprintf(stderr, "[sdl] turbo %s\n",
+                         turbo_active ? "on" : "off");
+        }
+
+        if ((relative_mouse.captured() || mph_prime_pad_engaged) &&
+            options.relative_mouse_direct_aim &&
+            !mph_prime_virtual_stylus &&
+            (relative_delta_x != 0 || relative_delta_y != 0 ||
+             mph_pad_frame_x != 0 || mph_pad_frame_y != 0)) {
+            // AMHE0 consumes signed per-frame aim deltas. Keep the native
+            // stylus held at center, but feed motion through those title-owned
+            // fields so turning never stops at a virtual touchscreen edge.
+            // The pad's right-stick contribution is pre-scaled and merges
+            // with the mouse counts here because the title fields are
+            // OVERWRITTEN per frame, not accumulated.
+            const NdsRelativeMouseDelta delta =
+                nds_scale_relative_mouse_delta(
+                    relative_delta_x, relative_delta_y,
+                    options.relative_mouse_sensitivity,
+                    options.relative_mouse_invert_y, 150);
+            const int32_t final_x = delta.x + mph_pad_frame_x;
+            const int32_t final_y = delta.y + mph_pad_frame_y;
+            if (nds_title_patches_apply_mph_mouse_delta(final_x, final_y)) {
+                ++relative_direct_writes;
+                if (mph_pad_frame_x != 0 || mph_pad_frame_y != 0)
+                    ++mph_pad_aim_writes;
+            }
+            relative_delta_x = 0;
+            relative_delta_y = 0;
+        }
+        if (generic_virtual_stylus) {
+            nds_set_touch(static_cast<uint16_t>(std::lround(mph_virtual_x)),
+                          static_cast<uint16_t>(std::lround(mph_virtual_y)),
+                          virtual_stylus_tap_held);
+        } else if (mph_prime_is_active) {
+            if (mph_touch_sequence.active()) {
+                mph_touch_sequence.tick();
+            } else if (mph_prime_virtual_stylus) {
+                const bool touch_down =
+                    mph_prime_held[static_cast<size_t>(
+                        MphPrimeAction::Shoot)] ||
+                    mph_prime_held[static_cast<size_t>(
+                        MphPrimeAction::ScanShoot)];
+                nds_set_touch(
+                    static_cast<uint16_t>(std::lround(mph_virtual_x)),
+                    static_cast<uint16_t>(std::lround(mph_virtual_y)),
+                    touch_down);
+            } else {
+                if (nds_title_patches_mph_should_release_touch_for_morph_boost(
+                        mph_prime_held[static_cast<size_t>(
+                            MphPrimeAction::BoostZoom)]))
+                    nds_set_touch(0, 0, false);
+                else
+                    nds_set_touch(128, 96, true);
+            }
+        }
+        const uint16_t next_scripted =
+            scripted_key_mask(shown_frames + 1);
+        if (next_scripted != scripted_pressed) {
+            scripted_pressed = next_scripted;
+            publish_keys();
+        }
+        publish_input_debug();
+
+        // ── Fast forward ─────────────────────────────────────────────────
+        // The audio queue is this loop's only clock: it sleeps while the queue
+        // is above the pacing floor and the emulator therefore cannot outrun
+        // playback. So the speed control is not a loop rewrite -- it is a
+        // playback-rate change. Scaling the stream's frequency ratio makes the
+        // device consume N times the bytes per wall second; the pacing sleep
+        // then permits N times the emulation, exactly like the reference port's
+        // "sped up" mode (pitch rises; sequences and timers stay honest because
+        // the guest still runs its own 60 Hz frames).
+        //
+        // A multiplier of 0 means off. The key is held, never toggled, and it is
+        // ignored while the settings menu is up so the two cannot fight.
+        const int fast_forward_multiplier =
+            menu_pauses_game && runtime_menu_open()
+                ? 0 : runtime_menu_state.settings.fast_forward;
+        const bool fast_forward_want =
+            fast_forward_multiplier > 1 && fast_forward_pressed;
+        if (fast_forward_want != fast_forward_active ||
+            (fast_forward_active &&
+             fast_forward_ratio != fast_forward_multiplier)) {
+            fast_forward_active = fast_forward_want;
+            fast_forward_ratio = fast_forward_multiplier;
+#if defined(NDS_HAVE_SDL3)
+            if (audio.stream) {
+                const float ratio = fast_forward_active
+                    ? static_cast<float>(fast_forward_multiplier) : 1.0f;
+                if (!SDL_SetAudioStreamFrequencyRatio(audio.stream, ratio)) {
+                    std::fprintf(stderr,
+                                 "[sdl] fast forward ratio %.2f refused: %s\n",
+                                 ratio, SDL_GetError());
+                }
+            }
+#else
+            // SDL2 has no stream-rate control on the queued device this
+            // frontend opens; the held key simply does nothing there.
+#endif
+            std::fprintf(stderr, "[sdl] fast forward %s\n",
+                         fast_forward_active ? "on" : "off");
+        }
+
+        const uint64_t phase0 = SDL_GetPerformanceCounter();
+        const uint64_t now = scheduler_system_timestamp();
+        const uint64_t next_frame =
+            (now / kSystemCyclesPerFrame + 1u) * kSystemCyclesPerFrame;
+        // "Pause in menu" freezes the machine, not the presentation: the last
+        // completed frame keeps being presented (and the menu keeps drawing)
+        // while no scheduler round runs, so a settings change is inspected
+        // against a still image. The device is paused with the machine --
+        // otherwise it would drain the ring dry and count underruns for audio
+        // nobody is producing -- and the loop idles at roughly one visual frame
+        // per iteration instead of spinning, because the emulated frame time is
+        // what normally paces this loop.
+        const bool menu_paused = menu_pauses_game && runtime_menu_open();
+        if (menu_paused != menu_paused_previous) {
+            menu_paused_previous = menu_paused;
+            if (audio) {
+                if (menu_paused)
+                    pause_audio(audio, true);
+                else if (audio_started)
+                    pause_audio(audio, false);
+            }
+            std::fprintf(stderr, "[sdl] menu pause %s\n",
+                         menu_paused ? "on" : "off");
+        }
+        if (menu_paused) SDL_Delay(16);
+        while (running && !menu_paused &&
+               scheduler_system_timestamp() < next_frame &&
+               !(scheduler_cpu_terminal_halted(0) &&
+                 scheduler_cpu_terminal_halted(1))) {
+            scheduler_run_round();
+        }
+        // A real DS power-off is an application lifecycle request, not a
+        // debuggable terminal halt. Leave before presenting the powered-down
+        // black framebuffer; main() performs durable state flushes.
+        if (nds_powered_off()) {
+            std::fprintf(stderr,
+                         "[sdl] guest requested power-off; closing\n");
+            running = false;
+            break;
+        }
+        uint64_t frame_emu_ticks = 0;
+        {
+            frame_emu_ticks = SDL_GetPerformanceCounter() - phase0;
+            phase_emu_ticks += frame_emu_ticks;
+            if (frame_emu_ticks > max_emu_ticks) {
+                max_emu_ticks = frame_emu_ticks;
+                max_emu_frame = shown_frames;
+            }
+            if (frame_emu_ticks * 1000u > frequency * 32u)
+                ++slow_frames_32ms;
+        }
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+        if (nds_gpu3d_compute_runtime_failed()) {
+            compute_failed = true;
+            running = false;
+            break;
+        }
+#endif
+        {
+            const uint64_t seen =
+                audio_queue.underruns.load(std::memory_order_relaxed);
+            if (seen != last_underruns_seen) {
+                if (!last_underruns_seen) first_underrun_frame = shown_frames;
+                last_underrun_frame = shown_frames;
+                last_underruns_seen = seen;
+            }
+        }
+
+        if (mouse_down || touch_release_pending)
+            ++touch_frames_held;
+        if (touch_release_pending && touch_frames_held >= 2) {
+            nds_set_touch(0, 0, false);
+            touch_release_pending = false;
+        }
+
+        const uint64_t phase1 = SDL_GetPerformanceCounter();
+        const uint32_t* const native_top = nds_gpu2d_framebuffer(0);
+        const uint32_t* top_pixels = native_top;
+        const uint32_t* bottom_pixels = nds_gpu2d_framebuffer(1);
+        uint16_t top_width = 256;
+        uint16_t bottom_width = 256;
+        const uint64_t adaptive_start = SDL_GetPerformanceCounter();
+        // Direct-present frames skip the adaptive compositor, so the HD
+        // surfaces must be invalidated here rather than inside it.
+        nds_gpu2d_invalidate_hd_frame();
+        if ((options.adaptive_screens & NDS_ADAPTIVE_TOP) &&
+            !nds_gpu2d_direct_present_frame_active())
+            top_pixels =
+                nds_gpu2d_adaptive_framebuffer(0, &top_width);
+        else if (nds_gpu2d_direct_present_frame_active())
+            top_width = nds_gpu3d_output_width();
+        if (options.adaptive_screens & NDS_ADAPTIVE_BOTTOM)
+            bottom_pixels =
+                nds_gpu2d_adaptive_framebuffer(1, &bottom_width);
+        phase_adaptive_ticks +=
+            SDL_GetPerformanceCounter() - adaptive_start;
+        observe_top_black_bands(native_top, shown_frames);
+        // At most ONE synthetic frame, presented ahead of the real one, so
+        // the visible order stays real(N-1), blend(N-1,N), real(N). No
+        // scheduler round, no input sampling, no audio production happens
+        // here: this only re-presents pixels that already exist. The direct
+        // presenter is excluded above; direct-present frames are excluded
+        // again per frame because their top surface lives on the GPU.
+        // Blending between frames would smear a scrub: fast forward is for
+        // getting somewhere, not for looking at it. It also shares turbo's
+        // problem that the queue floor no longer means what the gate assumes.
+        if (interpolation_active && blend_cache.valid && !turbo_active &&
+            !fast_forward_active &&
+            !nds_gpu2d_direct_present_frame_active() &&
+            blend_cache.widths[0] == top_width &&
+            blend_cache.widths[1] == bottom_width && audio_started &&
+            audio_queue_count(audio, audio_queue) >
+                kInterpolationAudioFloorFrames) {
+            blend_half(blend_cache.previous[0].data(), top_pixels,
+                       blend_cache.blended[0].data(),
+                       blend_cache.previous[0].size());
+            blend_half(blend_cache.previous[1].data(), bottom_pixels,
+                       blend_cache.blended[1].data(),
+                       blend_cache.previous[1].size());
+            const PresentationTicks synthetic_ticks = present_screens(
+                presentation, blend_cache.blended[0].data(), top_width,
+                blend_cache.blended[1].data(), bottom_width,
+                runtime_ui,
+                mph_prime_virtual_stylus || generic_virtual_stylus,
+                mph_virtual_x, mph_virtual_y,
+                savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
+                runtime_menu_state.settings.color_mode,
+                runtime_menu_state.settings.lcd_grid != 0,
+                virtual_controls, 0);
+            if (!synthetic_ticks.ok) {
+                compute_failed = true;
+                running = false;
+                break;
+            }
+            phase_upload_ticks += synthetic_ticks.upload;
+            phase_draw_ticks += synthetic_ticks.draw;
+            phase_swap_ticks += synthetic_ticks.swap;
+            // phase_present_ticks is measured from phase1, which already
+            // encloses this block; only the sub-counters need folding in.
+            ++synthetic_presents;
+            // Events are still consumed at exactly one point, the top of the
+            // loop, so input keeps its DS-frame sampling cadence. Pumping
+            // here only keeps the OS message queue from backing up across the
+            // extra present.
+            SDL_PumpEvents();
+        }
+        const PresentationTicks presentation_ticks = present_screens(
+            presentation, top_pixels, top_width,
+            bottom_pixels, bottom_width,
+            runtime_ui,
+            mph_prime_virtual_stylus || generic_virtual_stylus,
+            mph_virtual_x, mph_virtual_y,
+            savestate_notice.empty() ? nullptr : savestate_notice.c_str(),
+            runtime_menu_state.settings.color_mode,
+            runtime_menu_state.settings.lcd_grid != 0,
+            virtual_controls, shown_frames + 1);
+        if (!presentation_ticks.ok) {
+            compute_failed = true;
+            running = false;
+            break;
+        }
+        phase_upload_ticks += presentation_ticks.upload;
+        phase_draw_ticks += presentation_ticks.draw;
+        phase_swap_ticks += presentation_ticks.swap;
+        // Digest the exact surfaces the presenter was handed, after the
+        // present so the hash cost is never inside a measured present phase.
+        record_frame_digest(shown_frames, top_pixels, top_width,
+                            bottom_pixels, bottom_width,
+                            nds_gpu2d_direct_present_frame_active());
+        if (interpolation_active &&
+            !nds_gpu2d_direct_present_frame_active()) {
+            cache_presented_frame(blend_cache, 0, top_pixels, top_width);
+            cache_presented_frame(blend_cache, 1, bottom_pixels, bottom_width);
+            blend_cache.valid = true;
+        } else {
+            blend_cache.valid = false;
+        }
+        phase_present_ticks += SDL_GetPerformanceCounter() - phase1;
+        if (audio && audio_started) {
+            const uint32_t queued = audio_queue_count(audio, audio_queue);
+            audio_min_queue = std::min(audio_min_queue, queued);
+        }
+        const uint64_t phase2 = SDL_GetPerformanceCounter();
+        // Glide: after the prebuffered start, the pacing allowance decays a
+        // fixed step per frame from the prebuffer level down to the steady
+        // 63 ms target, shedding the extra startup latency over a couple of
+        // seconds without ever forcing the queue down during a slow stretch.
+        constexpr uint32_t kGlideStepFrames = 300;
+        if (audio_pace_floor > audio_queue_frames + kGlideStepFrames)
+            audio_pace_floor -= kGlideStepFrames;
+        else
+            audio_pace_floor = audio_queue_frames;
+        uint32_t queued = audio_queue_count(audio, audio_queue);
+        if (turbo_active) {
+            discard_spu_output();
+        } else if (!menu_paused) {
+            // A paused menu also pauses the audio device, and drain_audio's
+            // pacing loop waits for the device to consume the queue -- which
+            // never happens while it is paused. Skipping the drain outright is
+            // the only correct move: the machine is frozen, so the SPU produces
+            // nothing new and there is nothing to push.
+            queued = drain_audio(
+                audio, audio_queue, audio_started, audio_pace_floor,
+                audio_queue_error, audio_fade_frames, audio_fade_remaining);
+        }
+        const uint64_t frame_drain_ticks =
+            SDL_GetPerformanceCounter() - phase2;
+        phase_drain_ticks += frame_drain_ticks;
+        audio_max_queue = std::max(audio_max_queue, queued);
+        if (audio && !audio_started && !turbo_active &&
+            queued >= audio_start_threshold) {
+            // Opening paused and prebuffering avoids the guaranteed startup
+            // underrun produced by unpausing an empty SDL queue.
+            audio_queue.started.store(true, std::memory_order_relaxed);
+            pause_audio(audio, false);
+            audio_started = true;
+            audio_fade_remaining = audio_fade_frames;
+            audio_min_queue = queued;
+            audio_pace_floor = audio_start_threshold;
+        }
+
+        const uint64_t current_underruns =
+            audio_queue.underruns.load(std::memory_order_relaxed);
+        NdsGpu3dProfile current_gpu3d_profile{};
+        nds_gpu3d_profile(&current_gpu3d_profile);
+        // compute_readback_ns, not compute_map_ns: the latter only accumulates
+        // under NDS_PROFILE_GPU, so it read zero in every normal run.
+        const uint64_t frame_compute_map_ns =
+            current_gpu3d_profile.compute_readback_ns >=
+                    governor_last_compute_map_ns
+                ? current_gpu3d_profile.compute_readback_ns -
+                      governor_last_compute_map_ns
+                : 0u;
+        governor_last_compute_map_ns =
+            current_gpu3d_profile.compute_readback_ns;
+        NdsPerfGovernorSample governor_sample{};
+        governor_sample.emu_ms =
+            static_cast<double>(frame_emu_ticks) * 1000.0 /
+            static_cast<double>(frequency);
+        governor_sample.drain_ms =
+            static_cast<double>(frame_drain_ticks) * 1000.0 /
+            static_cast<double>(frequency);
+        governor_sample.budget_ms = 1000.0 / 60.0;
+        governor_sample.underruns_delta =
+            current_underruns >= governor_last_underruns
+                ? current_underruns - governor_last_underruns
+                : 0u;
+        governor_sample.compute_map_ms =
+            static_cast<double>(frame_compute_map_ns) / 1000000.0;
+        // The drain is only a headroom signal when it is actually the pacing
+        // sleep this frame: no device, pre-playback and turbo frames all read
+        // ~0 for reasons that have nothing to do with load.
+        governor_sample.headroom_valid =
+            static_cast<bool>(audio) && audio_started && !turbo_active &&
+            !fast_forward_active;
+        governor_last_underruns = current_underruns;
+        const uint8_t governor_stage_before = perf_governor.stage;
+        if (nds_perf_governor_update(&perf_governor, governor_sample)) {
+            const uint8_t requested_stage = perf_governor.stage;
+            NdsPerfGovernorReason reason = perf_governor.last_reason;
+            bool applied = apply_performance_governor_stage(
+                options, presentation, requested_stage);
+            if (!applied) {
+                // Nothing was mutated by the failed apply, so the previously
+                // installed stage is still the live one. Report that stage and
+                // stop deciding: retrying a failing rebuild every
+                // engage_frames forever is a hitch generator, not a recovery.
+                perf_governor.stage = governor_stage_before;
+                nds_perf_governor_mark_apply_failed(&perf_governor);
+                reason = NdsPerfGovernorReason::ApplyFailed;
+                std::fprintf(stderr,
+                             "[governor] stage %u apply failed; "
+                             "governor disabled at stage %u\n",
+                             static_cast<unsigned>(requested_stage),
+                             static_cast<unsigned>(perf_governor.stage));
+            }
+            // Never a no-op N->N transition. A failed apply is reported even
+            // when the stage did not move, because the terminal state is the
+            // information.
+            if (perf_governor.stage != governor_stage_before || !applied) {
+                nds_perf_governor_record_transition(
+                    governor_stage_before, perf_governor.stage, reason,
+                    shown_frames, perf_governor.stage2_held,
+                    perf_governor.apply_failed);
+                nds_diagnostics_note_perf_governor_transition(
+                    governor_stage_before, perf_governor.stage,
+                    nds_perf_governor_reason_name(reason));
+            }
+        }
+
+        ++shown_frames;
+        ++fps_frames;
+        g_live_stats.frames = shown_frames;
+        g_live_stats.emu_ticks = phase_emu_ticks;
+        g_live_stats.present_ticks = phase_present_ticks;
+        g_live_stats.adaptive_ticks = phase_adaptive_ticks;
+        g_live_stats.upload_ticks = phase_upload_ticks;
+        g_live_stats.draw_ticks = phase_draw_ticks;
+        g_live_stats.swap_ticks = phase_swap_ticks;
+        g_live_stats.drain_ticks = phase_drain_ticks;
+        g_live_stats.underruns = current_underruns;
+        g_live_stats.real_presents = shown_frames;
+        g_live_stats.synthetic_presents = synthetic_presents;
+        g_live_stats.perf_governor_stage = perf_governor.stage;
+        g_live_stats.perf_governor_over_frames = perf_governor.over_frames;
+        g_live_stats.perf_governor_under_frames =
+            perf_governor.under_frames;
+        g_live_stats.perf_governor_held = perf_governor.stage2_held ? 1u : 0u;
+        g_live_stats.perf_governor_apply_failed =
+            perf_governor.apply_failed ? 1u : 0u;
+        g_live_stats.perf_governor_transitions =
+            nds_perf_governor_history_total();
+        const uint64_t counter = SDL_GetPerformanceCounter();
+        if (!savestate_notice.empty() && counter >= savestate_notice_until)
+            savestate_notice.clear();
+        g_live_stats.now_ticks = counter;
+        g_live_stats.freq = frequency;
+        nds_diagnostics_maybe_write_performance_sample(g_live_stats);
+        if (counter - fps_start >= frequency) {
+            const double seconds = static_cast<double>(counter - fps_start) /
+                                   static_cast<double>(frequency);
+            const double fps = static_cast<double>(fps_frames) / seconds;
+            const std::string fps_text =
+                std::to_string(fps).substr(0, 4) + " FPS";
+            const std::string governor_text =
+                perf_governor.apply_failed
+                    ? " - Gov disabled (apply failed, S" +
+                          std::to_string(perf_governor.stage) + ")"
+                    : perf_governor.stage
+                    ? " - Gov S" + std::to_string(perf_governor.stage) +
+                          (perf_governor.stage2_held ? " held" : "")
+                    : "";
+            const std::string top_title = !savestate_notice.empty()
+                ? "ndsrecomp - " + savestate_notice
+                : presentation.separate
+                ? "ndsrecomp - Top Screen - " + fps_text + governor_text
+                : "ndsrecomp firmware preview - " + fps_text +
+                      governor_text;
+            SDL_SetWindowTitle(presentation.windows[0],
+                               top_title.c_str());
+            if (presentation.separate) {
+                const std::string bottom_title =
+                    "ndsrecomp - Bottom Screen - " + fps_text +
+                    governor_text;
+                SDL_SetWindowTitle(presentation.windows[1],
+                                   bottom_title.c_str());
+            }
+            fps_frames = 0;
+            fps_start = counter;
+        }
+
+        if (soak_frames && shown_frames >= soak_frames)
+            running = false;
+        if (selftest_menu && selftest_touch_up &&
+            nds_event_counts().vblank9 >= 600)
+            running = false;
+        if (selftest_relative_mouse && relative_mouse_selftest_stage == 10)
+            running = false;
+
+        if (scheduler_cpu_terminal_halted(0) &&
+            scheduler_cpu_terminal_halted(1)) {
+            SDL_Delay(8);
+        }
+    }
+
+    release_relative_mouse();
+    nds_set_touch(0, 0, false);
+    nds_set_key_mask(0x0FFFu);
+    g_live_stats.active = 0;
+    g_input_debug.active = 0;
+    nds_diagnostics_stop_performance_log();
+    const double soak_seconds = static_cast<double>(
+        SDL_GetPerformanceCounter() - soak_start) /
+        static_cast<double>(frequency);
+    const uint64_t top_hash = framebuffer_rgb_fnv(0);
+    const uint64_t bottom_hash = framebuffer_rgb_fnv(1);
+    if (audio) pause_audio(audio, true);
+    const uint64_t audio_underruns =
+        audio_queue.underruns.load(std::memory_order_relaxed);
+    // close_audio() clears the handle (SDL2 zeroes the device id, SDL3 nulls
+    // the stream), so whether a device was ever opened has to be latched
+    // BEFORE the close. The audio_failed verdict below reads this, not
+    // `audio` -- reading the closed handle made NDS_FRONTEND_REQUIRE_AUDIO=1
+    // report failure on every clean run.
+    const bool audio_opened = static_cast<bool>(audio);
+    close_audio(audio);
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+    nds_gpu2d_set_direct_present(false);
+    nds_compute_host_stop();
+#endif
+    if (controller) SDL_GameControllerClose(controller);
+    if (runtime_ui) {
+        recomp_runtime_ui_destroy(runtime_ui);
+        runtime_ui = nullptr;
+    }
+    destroy_presentation(presentation);
+    SDL_Quit();
+    std::fprintf(stderr, "[sdl] closed after %llu presented frames\n",
+                 static_cast<unsigned long long>(shown_frames));
+    if (print_stats || soak_frames || selftest_menu ||
+        selftest_relative_mouse) {
+        std::fprintf(stderr,
+            "[sdl] soak: frames=%llu seconds=%.3f fps=%.3f "
+            "audio_started=%u queue_errors=%u underruns=%llu "
+            "min_queue_frames=%u max_queue_frames=%u "
+            "key_presses=%llu touch_presses=%llu last_touch=(%d,%d) "
+            "frame_fnv=(%016llx,%016llx)\n",
+            static_cast<unsigned long long>(shown_frames), soak_seconds,
+            soak_seconds > 0.0 ? shown_frames / soak_seconds : 0.0,
+            audio_started ? 1u : 0u, audio_queue_error ? 1u : 0u,
+            static_cast<unsigned long long>(audio_underruns),
+            audio_min_queue == std::numeric_limits<uint32_t>::max()
+                ? 0u : audio_min_queue,
+            audio_max_queue,
+            static_cast<unsigned long long>(host_key_presses),
+            static_cast<unsigned long long>(host_touch_presses),
+            last_touch_event_x, last_touch_event_y,
+            static_cast<unsigned long long>(top_hash),
+            static_cast<unsigned long long>(bottom_hash));
+        const double tick_seconds = 1.0 / static_cast<double>(frequency);
+        std::fprintf(stderr,
+            "[sdl] phases: emu=%.3fs present=%.3fs drain=%.3fs other=%.3fs "
+            "max_emu_ms=%.1f@f%llu slow32ms=%llu underrun_frames=[%llu,%llu]\n",
+            phase_emu_ticks * tick_seconds,
+            phase_present_ticks * tick_seconds,
+            phase_drain_ticks * tick_seconds,
+            soak_seconds - (phase_emu_ticks + phase_present_ticks +
+                            phase_drain_ticks) * tick_seconds,
+            max_emu_ticks * tick_seconds * 1000.0,
+            static_cast<unsigned long long>(max_emu_frame),
+            static_cast<unsigned long long>(slow_frames_32ms),
+            static_cast<unsigned long long>(first_underrun_frame),
+            static_cast<unsigned long long>(last_underrun_frame));
+        std::fprintf(stderr,
+            "[sdl] present detail: adaptive=%.3fs upload=%.3fs "
+            "draw=%.3fs swap=%.3fs\n",
+            phase_adaptive_ticks * tick_seconds,
+            phase_upload_ticks * tick_seconds,
+            phase_draw_ticks * tick_seconds,
+            phase_swap_ticks * tick_seconds);
+        std::fprintf(stderr,
+            "[sdl] frame interpolation: mode=%s active=%u refresh=%dHz "
+            "min_refresh=%dHz real_presents=%llu synthetic_presents=%llu\n",
+            nds_frame_interpolation_name(options.frame_interpolation),
+            interpolation_active ? 1u : 0u,
+            interpolation_refresh_hz, interpolation_min_refresh_hz,
+            static_cast<unsigned long long>(shown_frames),
+            static_cast<unsigned long long>(synthetic_presents));
+        nds_profile_report(stderr);
+    }
+    const bool audio_failed = audio_queue_error ||
+        (require_audio &&
+         (audio_underruns != 0 || !audio_opened || !audio_started));
+    const bool menu_selftest_failed = selftest_menu &&
+        (selftest_event_error || !selftest_key_up || !selftest_touch_up ||
+         host_key_presses != 1 || host_touch_presses != 1 ||
+         last_touch_event_x != bottom_content_left + 127 ||
+         last_touch_event_y != (presentation.separate ? 180 : 372) ||
+         top_hash != 0xa0f41b93e4eefa55ull ||
+         bottom_hash != 0x6c43b370e9cda730ull);
+    const bool relative_mouse_selftest_failed = selftest_relative_mouse &&
+        (relative_mouse_selftest_error || relative_mouse_selftest_stage != 10);
+    if (selftest_menu)
+        std::fprintf(stderr, "[sdl] menu self-test: %s\n",
+                     menu_selftest_failed ? "FAIL" : "PASS");
+    if (selftest_relative_mouse)
+        std::fprintf(stderr, "[sdl] relative mouse self-test: %s\n",
+                     relative_mouse_selftest_failed ? "FAIL" : "PASS");
+    return (audio_failed || menu_selftest_failed ||
+            relative_mouse_selftest_failed || compute_failed) ? 1 : 0;
+}
+
+#else
+
+int nds_run_interactive_frontend(const NdsFrontendOptions&) {
+    std::fprintf(stderr,
+        "[sdl] this runner was built without SDL; configure NDS_SDL_BACKEND=SDL3 "
+        "or SDL2 for interactive presentation\n");
+    return 1;
+}
+
+#endif
+
+bool nds_frontend_request_exit() {
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+    if (!g_live_stats.active) return false;
+    SDL_Event event{};
+    event.type = SDL_QUIT;
+    return sdl_push_event(event);
+#else
+    return false;
+#endif
+}
+
+bool nds_frontend_debug_key(const char* key_name, bool down, bool shift) {
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+    if (!g_input_debug.active || !key_name || key_name[0] == '\0')
+        return false;
+    const SDL_Scancode key = scancode_from_binding_name(key_name);
+    g_input_debug.debug_last_key_scancode = static_cast<uint32_t>(key);
+    if (key == SDL_SCANCODE_UNKNOWN)
+        return false;
+    SDL_Event event{};
+    event.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+    event.key.windowID = g_input_debug.top_window_id;
+#if !defined(NDS_HAVE_SDL3)
+    event.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+#else
+    event.key.down = down;
+#endif
+    event.key.repeat = 0;
+    // Modifier state: savestate SAVE is Shift+F<slot> while LOAD is the bare
+    // F-key, so an injected key that cannot carry Shift can only ever load.
+#if defined(NDS_HAVE_SDL3)
+    event.key.mod = shift ? SDL_KMOD_LSHIFT : SDL_KMOD_NONE;
+#else
+    event.key.keysym.mod = shift ? KMOD_LSHIFT : KMOD_NONE;
+#endif
+    sdl_set_event_scancode(event, key);
+    const bool pushed = sdl_push_event(event);
+    if (pushed) ++g_input_debug.debug_key_events;
+    else ++g_input_debug.debug_event_errors;
+    return pushed;
+#else
+    (void)key_name;
+    (void)down;
+    (void)shift;
+    return false;
+#endif
+}
+
+bool nds_frontend_debug_mouse_button(uint8_t button, bool down) {
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+    if (!g_input_debug.active || button == 0)
+        return false;
+    SDL_Event event{};
+    event.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+    event.button.windowID = g_input_debug.top_window_id;
+    event.button.button = button;
+#if !defined(NDS_HAVE_SDL3)
+    event.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+#else
+    event.button.down = down;
+#endif
+    event.button.clicks = 1;
+    event.button.x = 128 * kWindowScale;
+    event.button.y = 96 * kWindowScale;
+    const bool pushed = sdl_push_event(event);
+    if (pushed) ++g_input_debug.debug_mouse_button_events;
+    else ++g_input_debug.debug_event_errors;
+    return pushed;
+#else
+    (void)button;
+    (void)down;
+    return false;
+#endif
+}
+
+bool nds_frontend_debug_mouse_motion(int dx, int dy) {
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+    if (!g_input_debug.active)
+        return false;
+    SDL_Event event{};
+    event.type = SDL_MOUSEMOTION;
+    event.motion.windowID = g_input_debug.top_window_id;
+    event.motion.x = 128 * kWindowScale;
+    event.motion.y = 96 * kWindowScale;
+    event.motion.xrel = dx;
+    event.motion.yrel = dy;
+    const bool pushed = sdl_push_event(event);
+    if (pushed) ++g_input_debug.debug_mouse_motion_events;
+    else ++g_input_debug.debug_event_errors;
+    return pushed;
+#else
+    (void)dx;
+    (void)dy;
+    return false;
+#endif
+}
+
+bool nds_frontend_debug_touch(uint16_t x, uint16_t y, bool down) {
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+    if (!g_input_debug.active || x >= kScreenWidth || y >= kScreenHeight)
+        return false;
+    SDL_Event event{};
+    event.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+    event.button.windowID = g_input_debug.bottom_window_id;
+    event.button.button = SDL_BUTTON_LEFT;
+#if !defined(NDS_HAVE_SDL3)
+    event.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+#else
+    event.button.down = down;
+#endif
+    event.button.clicks = 1;
+    event.button.x = (g_input_debug.bottom_content_left +
+                      static_cast<int>(x)) * kWindowScale;
+    event.button.y = (g_input_debug.separate ? static_cast<int>(y)
+                                             : kScreenHeight +
+                                                   static_cast<int>(y)) *
+                     kWindowScale;
+    const bool pushed = sdl_push_event(event);
+    if (pushed) ++g_input_debug.debug_touch_events;
+    else ++g_input_debug.debug_event_errors;
+    return pushed;
+#else
+    (void)x;
+    (void)y;
+    (void)down;
+    return false;
+#endif
+}
+
+bool nds_frontend_debug_capture_mouse() {
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+    if (!g_input_debug.active)
+        return false;
+    if (g_input_debug.relative_mouse_captured)
+        return true;
+    const bool pushed = nds_frontend_debug_mouse_button(SDL_BUTTON_LEFT, true);
+    if (pushed) ++g_input_debug.debug_capture_events;
+    return pushed;
+#else
+    return false;
+#endif
+}
+
+bool nds_frontend_debug_release_mouse() {
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+    if (!g_input_debug.active)
+        return false;
+    if (!g_input_debug.relative_mouse_captured)
+        return true;
+    SDL_Event event{};
+    sdl_make_window_event(event, SDL_EVENT_WINDOW_FOCUS_LOST,
+                          g_input_debug.top_window_id);
+    const bool pushed = sdl_push_event(event);
+    if (pushed) ++g_input_debug.debug_release_events;
+    else ++g_input_debug.debug_event_errors;
+    return pushed;
+#else
+    return false;
+#endif
+}
+
+bool nds_frontend_debug_capture_shot() {
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+    if (!g_input_debug.active) return false;
+    g_forced_shots.fetch_add(1, std::memory_order_relaxed);
+    return true;
+#else
+    return false;
+#endif
+}
+
+void nds_frontend_live_stats(NdsFrontendLiveStats* out) {    if (!out) return;
+    *out = g_live_stats;
+#if defined(NDS_HAVE_SDL3) || defined(NDS_HAVE_SDL2)
+    if (g_live_stats.active)
+        out->now_ticks = SDL_GetPerformanceCounter();
+#endif
+}
+
+void nds_frontend_input_debug_state(NdsFrontendInputDebugState* out) {
+    if (out) *out = g_input_debug;
+}
+
+void nds_frontend_black_band_scan(bool enabled, bool reset) {
+    if (reset) g_black_band = {};
+    g_black_band.enabled = enabled ? 1 : 0;
+#if defined(NDS_HAVE_COMPUTE_RENDERER)
+    nds_gpu2d_set_direct_present(
+        !enabled && nds_compute_host_has_visible_context());
+#endif
+}
+
+void nds_frontend_black_band_capture(NdsFrontendBlackBandCapture* out) {
+    if (out) *out = g_black_band;
+}
+
+bool nds_frontend_frame_digest_enabled() { return frame_digest_enabled(); }
+
+uint64_t nds_frontend_frame_digest_count() {
+    return g_frame_digest_count.load(std::memory_order_acquire);
+}
+
+uint32_t nds_frontend_frame_digests(uint64_t from, uint32_t max,
+                                    NdsFrontendFrameDigest* out) {
+    if (!out || !max) return 0;
+    const uint64_t count =
+        g_frame_digest_count.load(std::memory_order_acquire);
+    if (from >= count) return 0;
+    // The oldest sequence index still resident. A reader that asks for an
+    // evicted window gets nothing rather than a torn mixture of generations.
+    const uint64_t oldest =
+        count > kFrameDigestRing ? count - kFrameDigestRing : 0;
+    if (from < oldest) from = oldest;
+    uint32_t copied = 0;
+    for (uint64_t i = from; i < count && copied < max; ++i, ++copied)
+        out[copied] = g_frame_digests[i % kFrameDigestRing];
+    // Re-check: a wrap during the copy would have overwritten the head of the
+    // window. Only possible if the caller asked for ~2 minutes of history.
+    const uint64_t after =
+        g_frame_digest_count.load(std::memory_order_acquire);
+    if (after - from > kFrameDigestRing) return 0;
+    return copied;
+}

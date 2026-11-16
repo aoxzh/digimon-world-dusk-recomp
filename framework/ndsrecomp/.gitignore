@@ -1,0 +1,86 @@
+# ───────────────────────────────────────────────────────────────────────────
+# Copyrighted dumps — NEVER commit. These are Nintendo's BIOS/firmware images
+# and the per-machine key; the build hash-verifies the owner's own dumps.
+# ───────────────────────────────────────────────────────────────────────────
+bios/*.rom
+bios/*.bin
+bios/*.ROM
+bios/*.cfg
+# (kept: bios/*.toml curated configs, bios/README.md)
+
+# ───────────────────────────────────────────────────────────────────────────
+# Derived-from-BIOS artifacts — recompiled BIOS C and Ghidra-extracted analysis
+# are derivative works of the copyrighted dumps; regenerated, never committed.
+# ───────────────────────────────────────────────────────────────────────────
+generated/*
+!generated/.gitkeep
+
+# Ghidra project state holds the disassembled BIOS programs (derivative) + is
+# large binary churn. Keep the scripts (ghidra/*.py, *.sh) and ghidra/README.md.
+ghidra/*.gpr
+ghidra/*.rep/
+ghidra/*.lock
+ghidra/*.lock~
+
+# ───────────────────────────────────────────────────────────────────────────
+# Oracle emulator clone — melonDS is GPLv3, kept out of the native build and
+# vendored locally by oracle/setup-melonds.sh. The oracle shim itself lives in
+# oracle/shim/ (tracked); only melonDS source edits ship as oracle/patches/*.
+#
+# `third_party/*` rather than `third_party/`: git will not descend into an
+# excluded directory, so the bare form makes the freebios negation below dead
+# and silently drops FreeBIOS from every clone. FreeBIOS is BSD-2-Clause and is
+# the no-dump boot path, so it is deliberately tracked; the rest of
+# third_party/ (the melonDS clone) stays out.
+# ───────────────────────────────────────────────────────────────────────────
+third_party/*
+!third_party/freebios/
+
+# ── Build trees ────────────────────────────────────────────────────────────
+build/
+build-*/
+build_*/
+*.o
+*.obj
+*.exe
+*.a
+*.lib
+
+# ── Runtime artifacts ──────────────────────────────────────────────────────
+*.log
+*.out
+*.err
+*.bmp
+dispatch_misses.log
+
+# Ad-hoc framebuffer captures produced while converging against the oracle.
+# Curated documentation images should use descriptive names without the
+# leading underscore and may be tracked explicitly.
+oracle/_*.png
+oracle/_*.ppm
+oracle/_*.rgb
+
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+
+# ── Editor / OS cruft ──────────────────────────────────────────────────────
+.vs/
+.idea/
+.vscode/
+*.user
+.DS_Store
+Thumbs.db
+
+# Vendored third_party/ contents stay out (see the rule above); freebios is the
+# one exception and keeps its own LICENSE.txt in-tree.
+# toml++ is staged by cmake/NdsTomlPlusPlus.cmake at configure time (downloaded
+# and SHA-256 verified), so it is a build artifact, not a source file.
+/recompiler/third_party/
+
+# Tier-2 toolchain downloads and test scratch
+/tools/_toolchain_cache/
+/runner/tests/live-index-lock-work/
+
+# Runtime-generated per-install identity (written by the runner when profile dir = repo root)
+runner/freebios/
