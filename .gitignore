@@ -1,0 +1,20 @@
+# Build output and caches. Anything built from a ROM contains translated game
+# code and must never be committed.
+/external/
+/build/
+/generated/
+/run/
+/dist/
+/.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Game and console data never enters this repository.
+*.nds
+*.sav
+*.dsv
+bios*.bin
+bios*.rom
+firmware*.bin
+dsfirmware.bin

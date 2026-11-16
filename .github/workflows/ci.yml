@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s tests -v
+
+  framework-patch:
+    # The pinned framework commit must still exist and the patch must apply.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: apply patches/ndsrecomp.patch to the pinned commit
+        run: |
+          set -euo pipefail
+          url=$(python3 -c 'import json;print(json.load(open("framework.lock.json"))["ndsrecomp"]["url"])')
+          commit=$(python3 -c 'import json;print(json.load(open("framework.lock.json"))["ndsrecomp"]["commit"])')
+          git clone --filter=blob:none --no-checkout "$url" fw
+          git -C fw checkout --quiet "$commit"
+          git -C fw apply --check --whitespace=nowarn "$PWD/patches/ndsrecomp.patch"
